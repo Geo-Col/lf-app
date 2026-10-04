@@ -72,7 +72,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 19  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 20  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
@@ -3254,26 +3254,47 @@ class Tunnel:
         return bool(img and img.lower().endswith("cloudflared.exe") and st.get("port") == self.port)
 
     def _start(self):
+        """Start cloudflared; the link only counts once the tunnel has REGISTERED with Cloudflare - the address is
+        printed before that, and a PC whose network blocks the connection would hand out a dead link. HTTP/2 over
+        TCP 443 gets through routers / firewalls / VPNs that block QUIC (UDP), cloudflared's default."""
+        if not self._local_ok():
+            log_file.warning(f"Phone view server isn't answering on port {self.port} - the Anywhere link would show "
+                             "a Cloudflare error. Is another program using that port?")
         with open(self.LOG, "w") as lf:
-            proc = subprocess.Popen([self.exe, "tunnel", "--no-autoupdate", "--url", f"http://localhost:{self.port}"],
+            proc = subprocess.Popen([self.exe, "tunnel", "--no-autoupdate", "--protocol", "http2",
+                                     "--url", f"http://localhost:{self.port}"],
                                     stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     creationflags=0x00000008 | 0x00000200)  # DETACHED | NEW_PROCESS_GROUP
-        for _ in range(60):
+        url = None
+        for _ in range(90):
             time.sleep(1)
             try:
-                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", open(self.LOG, errors="replace").read())
+                text = open(self.LOG, errors="replace").read()
             except OSError:
-                m = None
-            if m:
-                st = {"pid": proc.pid, "url": m.group(), "port": self.port}
+                text = ""
+            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", text)
+            url = m.group() if m else url
+            if url and "Registered tunnel connection" in text:
+                st = {"pid": proc.pid, "url": url, "port": self.port}
                 with open(self.STATE, "w") as f:
                     json.dump(st, f)
                 return st
             if proc.poll() is not None:
                 break
-        log_file.warning("cloudflared didn't give a link: " + open(self.LOG, errors="replace").read()[-400:])
+        log_file.warning(("cloudflared got a link but never connected (network blocking it?): " if url else
+                          "cloudflared didn't give a link: ") + open(self.LOG, errors="replace").read()[-500:])
         proc.kill()
         return None
+
+    def _local_ok(self):
+        """The phone view server answers (403 without the key still means it's up)."""
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{self.port}/status", timeout=5).close()
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except Exception:
+            return False
 
     def _run(self):
         try:

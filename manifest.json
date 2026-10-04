@@ -1,7 +1,7 @@
 {
- "version": 19,
+ "version": 20,
  "files": {
-  "bot.py": "57050ebd1ab0e64c7817b800abdad32dd4d4b4f4df49b9e15d9c22de9ef1adbd",
+  "bot.py": "514b9a2e687e9430e3e6900ae5e0ad398b6c1d5505535eed51088824fa2ac824",
   "setup.ps1": "2ef2b8485cb8aecc277dafc238afa8002093f611728e017e8124fd53c7faf25f",
   "Setup.bat": "3d3ea502d691eccb7207f2d7388826a07c48f3f0c8eafa6c0a96df51b88bb8d3",
   "README.txt": "5e5ebd4c2582976e28beff33666188f259029bee093000218d54e42cc34a6984",
