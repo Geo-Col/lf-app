@@ -72,7 +72,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 21  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 22  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -316,7 +316,7 @@ SETTINGS = [
 ]
 
 RUNTIME_KEYS = ("scans", "plans", "account_tags", "_last_account_idx", "loot_rate", "line_view", "ui_mode",
-                "sc_of_tag")  # saved by the bot, not settings
+                "sc_of_tag", "shortcuts_v")  # saved by the bot, not settings
 # Rarely-touched tuning: shown under 'Show advanced settings'
 ADVANCED = {"loot_settle_delay", "loot_recheck_delay", "loot_max_plausible", "hold_deploy", "damage_confirm_count",
             "timer_poll_interval", "hold_ms_per_troop",
@@ -1561,9 +1561,13 @@ class Bot:
         self.attack_now()
 
     def on_menu(self, frame, prev):
+        if self.mode.startswith("bb_"):  # Builder Base only: never start a home-village attack - back out
+            return self.back_to_village()
         self.tap(self.hits["find_match_button"], self.cfg["matchmaking_settle_delay"])
 
     def on_army(self, frame, prev):
+        if self.mode.startswith("bb_"):
+            return self.back_to_village()
         self.tap(self.hits["confirm_attack_button"], self.cfg["matchmaking_settle_delay"])
 
     def on_bbend(self, frame, prev):
@@ -1611,6 +1615,9 @@ class Bot:
 
     def on_scout(self, frame, prev):
         c = self.cfg
+        if self.mode.startswith("bb_"):  # Builder Base only: leave a home search (End Battle before deploying is free)
+            hit = self.find(frame, "surrender_button")
+            return self.tap(hit, 3.0) if hit else self.back_to_village()
         self.start_view()
         if c["loot_force_attack"]:
             return self.attack(None, None)
@@ -2345,7 +2352,8 @@ class Bot:
         # just rolls over with no popup - then this account is done until tomorrow.
         for _ in range(12):
             if self.bb_done_today(name):
-                self.log("Builder Base: no Star Bonus left today - no attacks.")
+                if not self.mode.startswith("bb_"):
+                    self.log("Builder Base: no Star Bonus left today - no attacks.")
                 break
             if self.bb_bonus(name):
                 last = None  # the counter restarts after a bonus: that's not a 'rolled over without one'
@@ -2376,19 +2384,28 @@ class Bot:
             self.bb_attack()
 
     def bb_only(self):
-        """'Builder Base only' modes: stay on the Builder Base. 'bb_farm' also keeps its builders + Star Lab busy
-        (following the planner); 'bb_loot' doesn't upgrade. Attack for today's Star Bonuses first; once they're done,
-        attacks still fill the Elixir Cart - so keep attacking in rounds of 10, collecting the cart after each
-        round, and move on to the next account between rounds when rotating."""
+        """'Builder Base only' modes: stay on the Builder Base.
+        bb_loot: attack non-stop on this account, claiming the Elixir Cart every 10 attacks.
+        bb_farm: builders + Star Lab follow the planner, attacks for today's Star Bonuses, then rounds of 10 attacks
+        to fill the Elixir Cart, moving on to the next account between rounds when rotating."""
         name = self.account_name(self.shot())
         self.emit("state", f"Builder Base only ({name})")
         self.bb_bonus(name)
         self.bb_collect()
         self.bb_clock_boost()
-        self.bb_session(name, upgrades=self.mode == "bb_farm")
+        if self.mode == "bb_loot":  # loot only: a plain loop on this account - attack, attack, attack; claim the
+            for _ in range(10):     # Elixir Cart every 10 attacks. No Star Bonus counting, upgrades or switching.
+                self.bb_bonus(name)  # a Star Bonus popup can still show up: collect it and carry on
+                if not self.find(self.shot(), "bb_attack_button") and not self.wait_for("bb_attack_button", 20):
+                    return  # not back on the village: the main loop sorts the screen out
+                self.bb_attack()
+            return  # next round: collect (the cart) + boost, then 10 more
+        self.bb_session(name, upgrades=True)
         if not self.bb_done_today(name):
             return  # attacks stopped for another reason (screen, battle): look again
-        self.log(f"Builder Base only: Star Bonuses done ({name}) - attacking on to fill the Elixir Cart.")
+        if getattr(self, "_bb_on_logged", None) != name:
+            self._bb_on_logged = name
+            self.log(f"Builder Base only: Star Bonuses done ({name}) - attacking on to fill the Elixir Cart.")
         for _ in range(10):
             if not self.find(self.shot(), "bb_attack_button"):
                 if not self.wait_for("bb_attack_button", 20):
@@ -3405,7 +3422,7 @@ async function tick(){try{const s=await (await fetch("status"+Q,{cache:"no-store
 const st=$("state");st.textContent=s.state;st.className="pill"+(/idle|stopped/i.test(s.state)?" idle":/recover/i.test(s.state)?" off":"");
 $("mode").textContent=s.mode?"Mode: "+s.mode:"";
 const R=s.rates||{};$("rates").innerHTML=[["gold","gold"],["elixir","elixir"],["dark","dark"]].map(([k,c])=>
-`<div class="c"><img src="${ic(k)}"><div style="min-width:0"><div class="v ${c}">${((R[k]||["—"])[0]).replace(" / h","").replace(/(\.\d)\dM/,"$1M")}</div><div class="l">per hour</div><div class="l" style="text-transform:none">${((R[k]||["",""])[1]).replace(" this session"," total")}</div></div></div>`).join("");
+`<div class="c"><img src="${ic(k)}"><div style="min-width:0"><div class="v ${c}">${((R[k]||["—"])[0]).replace(" / h","").replace(/(\\.\\d)\\dM/,"$1M")}</div><div class="l">per hour</div><div class="l" style="text-transform:none">${((R[k]||["",""])[1]).replace(" this session"," total")}</div></div></div>`).join("");
 $("store").innerHTML=[["s_gold","gold","gold"],["s_elixir","elixir","elixir"]].map(([k,i,c])=>
 `<div class="c"><img src="${ic(i)}"><div class="v ${c}">${s[k]??"—"}</div></div>`).join("");
 $("g").innerHTML=STATS.map(([k,l,i])=>`<div class="c s"><div class="l">${i?`<img src="${ic(i)}" style="height:14px;vertical-align:-2px"> `:""}${l}</div><div class="v">${s[k]??"-"}</div></div>`).join("");
@@ -3725,6 +3742,59 @@ def post_discord(cfg, text, files=()):
     log_file.warning("Discord post failed 5 times - giving up on this message.")
 
 
+SHORTCUT_PS = r"""
+param([string]$Bot, [string]$PyW, [string]$Ico, [string]$AppId)
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+[ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IPropertyStore { int GetCount(out uint c); int GetAt(uint i, out PROPERTYKEY k);
+  int GetValue(ref PROPERTYKEY k, out PROPVARIANT v); int SetValue(ref PROPERTYKEY k, ref PROPVARIANT v); int Commit(); }
+[StructLayout(LayoutKind.Sequential, Pack = 4)] public struct PROPERTYKEY { public Guid fmtid; public uint pid; }
+[StructLayout(LayoutKind.Explicit)] public struct PROPVARIANT { [FieldOffset(0)] public ushort vt; [FieldOffset(8)] public IntPtr p; }
+public static class Aumid {
+  [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+  static extern int SHGetPropertyStoreFromParsingName(string path, IntPtr bc, int flags, ref Guid iid, out IPropertyStore ps);
+  public static void Set(string lnk, string id) {
+    Guid iid = new Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"); IPropertyStore ps;
+    if (SHGetPropertyStoreFromParsingName(lnk, IntPtr.Zero, 2, ref iid, out ps) != 0) return;
+    PROPERTYKEY k = new PROPERTYKEY { fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), pid = 5 };
+    PROPVARIANT v = new PROPVARIANT { vt = 31, p = Marshal.StringToCoTaskMemUni(id) };
+    ps.SetValue(ref k, ref v); ps.Commit(); Marshal.ReleaseComObject(ps); } }
+'@
+$ws = New-Object -ComObject WScript.Shell
+$pinned = Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
+$links = @((Join-Path ([Environment]::GetFolderPath("Desktop")) "Loot Farmer.lnk"),
+           (Join-Path ([Environment]::GetFolderPath("Programs")) "Loot Farmer.lnk"))
+if (Test-Path $pinned) { $links += Get-ChildItem $pinned -Filter *.lnk | ForEach-Object { $_.FullName } }
+foreach ($l in $links) {
+  $isOurs = $false
+  if (Test-Path $l) { $s = $ws.CreateShortcut($l); $isOurs = ($s.Arguments -like "*bot.py*") -or ($s.TargetPath -like "*bot.py") }
+  elseif ($l -notlike "$pinned*") { $isOurs = $true }  # desktop / Start menu: create it
+  if (-not $isOurs) { continue }
+  $s = $ws.CreateShortcut($l); $s.TargetPath = $PyW; $s.Arguments = '"' + $Bot + '"'
+  $s.WorkingDirectory = Split-Path $Bot; $s.IconLocation = $Ico; $s.Description = "Loot Farmer"; $s.Save()
+  [Aumid]::Set($l, $AppId); "ok $l"
+}
+"""
+
+
+def fix_shortcuts():
+    """Desktop + Start menu + pinned taskbar shortcuts that start this bot.py: the King icon and the app's taskbar
+    identity (so the running window groups under it, not under Python). Windows only; quietly does nothing else."""
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    ico = os.path.join(WIKI_DIR, "ui", "app.ico")
+    if os.name != "nt" or not os.path.isfile(pyw) or not os.path.isfile(ico):
+        return False
+    ps1 = os.path.join(tempfile.gettempdir(), "lootfarmer_shortcuts.ps1")
+    with open(ps1, "w", encoding="utf-8-sig") as f:
+        f.write(SHORTCUT_PS)
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-Bot",
+                        os.path.abspath(__file__), "-PyW", pyw, "-Ico", ico, "-AppId", APP_ID],
+                       capture_output=True, text=True, timeout=90, creationflags=NO_WINDOW)
+    log_file.info("shortcuts: " + (" | ".join(r.stdout.split()) or r.stderr.strip()[-300:]))
+    return r.returncode == 0
+
+
 def single_instance():
     """A machine-wide lock so only one Loot Farmer drives the emulator. Waits a few seconds first, so the
     Restart / Update buttons (new copy starts while the old one closes) still work. None = another is running."""
@@ -3844,7 +3914,7 @@ SIDE, NAV_ON = "#141414", "#262b33"  # sidebar, selected page
 # what the mode picker shows: mode -> (title, one line, icon in wiki/ui)
 MODES = {"farm": ("Full farm", "Attacks, upgrades, walls", "king"), "loot": ("Loot only", "Just attack", "gold"),
          "walls": ("Walls only", "Farm + buy walls", "wall"),
-         "bb_loot": ("BB loot", "Builder Base: bonus + cart", "bgold"),
+         "bb_loot": ("BB loot", "Builder Base: attack non-stop", "bgold"),
          "bb_farm": ("BB farm", "Builder Base + upgrades", "builderhall")}
 GREEN, AMBER, RED, BLUE, GOLD, PINK = "#4cc38a", "#e5b454", "#ff6b6b", "#57a6ff", "#f5c542", "#d77bff"
 LEVEL_COLORS = {"info": TEXT, "ok": GREEN, "warn": AMBER, "err": RED}
@@ -4460,6 +4530,12 @@ class App(tk.Tk):
         if warn:
             self.log(warn, "warn")
         self.bg(self._initial_connect)
+        if self.cfg.get("shortcuts_v") != APP_VERSION:  # after an update: shortcuts get the King icon
+            def shortcuts():
+                if fix_shortcuts():
+                    self.cfg["shortcuts_v"] = APP_VERSION
+                    save_config(self.cfg)
+            self.bg(shortcuts)
         self.after(3000, self._update_tick)
 
     # --- helpers ---
