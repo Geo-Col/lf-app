@@ -1,7 +1,7 @@
 {
- "version": 20,
+ "version": 21,
  "files": {
-  "bot.py": "514b9a2e687e9430e3e6900ae5e0ad398b6c1d5505535eed51088824fa2ac824",
+  "bot.py": "49646d1773d566faf3c8ae09533fc49a477eda64e159c3f461f21c5e582a3f60",
   "setup.ps1": "2ef2b8485cb8aecc277dafc238afa8002093f611728e017e8124fd53c7faf25f",
   "Setup.bat": "3d3ea502d691eccb7207f2d7388826a07c48f3f0c8eafa6c0a96df51b88bb8d3",
   "README.txt": "5e5ebd4c2582976e28beff33666188f259029bee093000218d54e42cc34a6984",
@@ -132,6 +132,31 @@
   "wiki/icons/home_wall.png": "2c4a92feae38f248c81b92a7837b647cd40dab7d5d54d981c0b2a612110160e0",
   "wiki/icons/home_wizard_tower.png": "b7473499f9aa9ca319bcfe838015440b056080268339e926f016b7d5ee8e4e80",
   "wiki/icons/home_workshop.png": "272e4beeacbf446b2d490e192df9bad5d40600fa51cb1257dc73154f947d646b",
-  "wiki/icons/home_x_bow.png": "7b390f66b1ad3404c339a0b31dccd8f354257872edd88181d3c63029240715c7"
+  "wiki/icons/home_x_bow.png": "7b390f66b1ad3404c339a0b31dccd8f354257872edd88181d3c63029240715c7",
+  "wiki/ui/app.ico": "89e60f7ba9608af90c1ebeadd33860ea64cf9b94647aee28f9ad09bbc3359fbc",
+  "wiki/ui/battlemachine.png": "02eabc66ce3eaeabc095c5939ae79479b1ef4650336697a3525d56f3d876c2b5",
+  "wiki/ui/belixir.png": "35a7557f06c1f3cb2770752f78de1dd7ecf6dc3cbc86184c545a61c8a54cc899",
+  "wiki/ui/bgold.png": "a9da9f198b557448e4a9ca80ec6f234e463809200b4b5063163ee2610b032239",
+  "wiki/ui/boat.png": "316f9c2cd151b071c6a4f17b615c937b916fc17d3c7d3036a8e09150feea8c96",
+  "wiki/ui/builder.png": "0008dd00b913e6381faac3132c7b3512d6dccfdb5d265cf43f90542e4afa0cc8",
+  "wiki/ui/builder_icon.png": "f39743cdc1647a43a1175c40cefe7ba4b00ca28d87e327c7ce53251573640c90",
+  "wiki/ui/builderhall.png": "6cbaffd6069c8988617875dd1fafae1737a6d8fa2c0f5ee58557486410a9cf94",
+  "wiki/ui/clancastle.png": "3175ee4a8aed9e74a0da22fc0ccce7b488006fab780c49433fac67a85a05772a",
+  "wiki/ui/clock.png": "a47f0647ca2dd08e7dfef495a7af2ac926217a77d036723f11ed7e49b6d35d1f",
+  "wiki/ui/dark.png": "76bea9c5d368412084da17f76e52d7d2b7f2fc1e9e520b7387be0f91a830b28e",
+  "wiki/ui/elixir.png": "714ac9cf9baad3697f30ce06fb88d8ea53c60c20eff89403000add7cd4f1afe9",
+  "wiki/ui/gem.png": "7ddcdaa708459491cf8222c975155addfeae9d4e06135bbffccb74742e2b4c33",
+  "wiki/ui/gold.png": "d884b06e310c1b225ce421f360a88648892a3f879f56639a4f7cee58fd70107c",
+  "wiki/ui/hammer.png": "606ae8f258b005316edee743cfa28f0c9c3dc5f4e7315a69681d4d3eeb072541",
+  "wiki/ui/king.png": "d2f88437888be6a921b2205beac5ab5c9060fc59f41608bd30ea38e92a7e250a",
+  "wiki/ui/lab.png": "4397281ffe8f3ff85a366638fce1631f5876fcaf2cdb0cee23f167570f045dd9",
+  "wiki/ui/raid.png": "16415d99fc307785c0eb11d793e8d71134896b0ee55557482cd97549b391e6dc",
+  "wiki/ui/settings.png": "0eda2a4057b8538de75aa67db3fccba84ec1c695a3ecbbf9ca79deb0f7eea60c",
+  "wiki/ui/shield.png": "e7c096a778aa42efaaedcd7118c8464089d8cee84150244b753b1def0bba8a5d",
+  "wiki/ui/shop.png": "262c81e2a089ea1c28c0fc28a342250ff37a0d134487c3acf0d34e3b0ea764e9",
+  "wiki/ui/townhall.png": "8a980d5104c71bbcdb5f607a45d35f77e7dab69edae0ae2fae5cb1273432547d",
+  "wiki/ui/trophy.png": "04b16225d17c530d5c0fb2c6fac4a948d0687b817e1e0c8366faf9cabb0bf279",
+  "wiki/ui/wall.png": "26861a916bb6fb44eaa0b7ef038a6208af9482397214303fb2d03985e8b0090f",
+  "wiki/ui/xp.png": "9d30ac1f2a71250a4794310fc26861e5ece8b7fe2a00dcfb9f5326eec2468d53"
  }
 }

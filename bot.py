@@ -72,7 +72,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 20  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 21  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
@@ -314,7 +315,8 @@ SETTINGS = [
     ]),
 ]
 
-RUNTIME_KEYS = ("scans", "plans", "account_tags", "_last_account_idx", "loot_rate", "line_view")  # saved by the bot, not settings
+RUNTIME_KEYS = ("scans", "plans", "account_tags", "_last_account_idx", "loot_rate", "line_view", "ui_mode",
+                "sc_of_tag")  # saved by the bot, not settings
 # Rarely-touched tuning: shown under 'Show advanced settings'
 ADVANCED = {"loot_settle_delay", "loot_recheck_delay", "loot_max_plausible", "hold_deploy", "damage_confirm_count",
             "timer_poll_interval", "hold_ms_per_troop",
@@ -1148,6 +1150,24 @@ def settings_drag_start(f):
     return max(low) if low else None
 
 
+def settings_tag(frame):
+    """Player tag under the name in the Settings window ('#V9GJCRCL'), or None. Q and 0 look alike: compare tags
+    with same_tag()."""
+    if not HAVE_TESS:
+        return None
+    k = frame.shape[1] / 1920
+    g = cv2.cvtColor(frame[int(226 * k):int(262 * k), int(860 * k):int(1120 * k)], cv2.COLOR_BGR2GRAY)
+    try:
+        t = pytesseract.image_to_string(cv2.resize(g, None, fx=3, fy=3), timeout=5,
+                                        config="--psm 7 -c tessedit_char_whitelist=#0289PYLQGRJCUV").strip()
+    except Exception:
+        return None
+    return t if re.fullmatch(r"#[0289PYLQGRJCUV]{6,10}", t) else None
+
+
+same_tag = lambda a, b: bool(a and b) and a.replace("Q", "0") == b.replace("Q", "0")
+
+
 def settings_name(frame):
     """Player name beside the avatar in the Settings window (white on blue), or None."""
     if not HAVE_TESS:
@@ -1269,7 +1289,8 @@ class Abort(Exception):
 
 class Bot:
     def __init__(self, cfg, adb, emit, mode="farm"):
-        self.cfg, self.adb, self.emit, self.mode = cfg, adb, emit, mode  # "farm", "loot" (attack only), "walls"
+        # "farm", "loot" (attack only), "walls", "bb_loot" / "bb_farm" (Builder Base only, without / with upgrades)
+        self.cfg, self.adb, self.emit, self.mode = cfg, adb, emit, mode
         self.stop_evt = threading.Event()
         self.v = Vision()
         self.stats = dict(attacks=0, skipped=0, walls=0, upgrades=0, switches=0, recoveries=0, errors=0)
@@ -1382,6 +1403,8 @@ class Bot:
                             unknown_since, backs = None, 0
                         elif self.reload_if_disconnected(frame):
                             unknown_since = None
+                        elif self.bb_bonus(self._last_name or "?"):  # the Star Bonus popup (home or Builder
+                            unknown_since = None                     # Base) - known, so no need to ask Groq
                         elif self.find(frame, "wall_okay_button"):
                             self.log("Closing an Okay/Cancel dialog with Back (never confirms).")
                             self.adb.back()
@@ -1461,6 +1484,9 @@ class Bot:
         elif len(name) >= 3:
             self._names.append(name)
             self._last_name = name
+        key = getattr(self, "_sc_key", None)
+        if key and self._last_name and key.startswith(self._last_name + " ("):
+            self._last_name = key  # one of two accounts sharing an in-game name
         # unreadable (e.g. the XP bar animating over it just after a battle): the account hasn't changed
         return self._last_name or "?"
 
@@ -1494,6 +1520,11 @@ class Bot:
         storage = self.track_loot(frame, self.read_storage(frame))
         if self.mode == "loot":  # Loot only: no upgrades, walls or account switching - just attack
             return self.attack_now()
+        if self.mode.startswith("bb_"):  # Builder Base only: never stays home
+            if not self.take_boat("builder"):
+                self.log("Builder Base only: couldn't find the boat - trying again in 2 min.", "warn")
+                self.sleep(120)
+            return
         if self.mode == "walls":  # Walls only: farm, and every time the next wall level is affordable, buy it
             if self.maybe_rescan("builder", hours=1):  # keeps the dashboard's wall count current
                 return
@@ -1540,6 +1571,8 @@ class Bot:
 
     def on_bbhome(self, frame, prev):
         """On the Builder Base outside a visit (a restart, a crash, a stray boat tap): collect and sail home."""
+        if self.mode.startswith("bb_"):
+            return self.bb_only()
         self.bb_bonus(self._last_name or "?")
         self.bb_collect()
         if not self.take_boat("home"):
@@ -1716,8 +1749,8 @@ class Bot:
         loot = f" - gold {gold:,} / elixir {elixir:,}" if gold is not None and elixir is not None else ""
         self.log(f"Attacking{loot}", "ok")
         self.bump("attacks")
-        self.deploy()
-        self.finish_battle()
+        if self.deploy():
+            self.finish_battle()
 
     def deploy(self):
         c = self.cfg
@@ -1744,8 +1777,23 @@ class Bot:
             cv2.imwrite(os.path.join(BASE_DIR, "debug_deploy.png"), dbg)
         except Exception as e:
             log_file.info(f"debug_deploy.png: {e}")
-        if not self.auto_deploy(a, b, bar):
-            self.log("Couldn't read the troop bar - no troops deployed (see debug_deploy.png).", "err")
+        if self.auto_deploy(a, b, bar):
+            return True
+        # no troop bar: often the game was still / again searching (white clouds) - wait for the screen to settle
+        for _ in range(8):
+            self.sleep(1.0)
+            f = self.shot()
+            if self.find(f, "next_button"):  # a base to scout (again): the main loop checks its loot first
+                self.log("The game was still searching when the army was due - checking this base's loot again.",
+                         "warn")
+                self._view = None
+                return False
+            if troop_bar(f):
+                if self.auto_deploy(a, b):
+                    return True
+                break
+        self.log("Couldn't read the troop bar - no troops deployed (see debug_deploy.png).", "err")
+        return True  # in a battle we can't use: finish_battle surrenders it
 
     def finish_battle(self):
         c = self.cfg
@@ -1869,7 +1917,11 @@ class Bot:
             if time.time() < self._bank_backoff.get(cur, 0):
                 continue
             self.sleep(0.5)
-            again = white_number(self.shot(), self.cfg["ocr_regions"].get(f"bank_{cur}_region") or (0, 0, 1, 1))
+            region = self.cfg["ocr_regions"].get(f"bank_{cur}_region") or (0, 0, 1, 1)
+            again = white_number(self.shot(), region)
+            if again is None:  # the counter mid-animation (just after a battle): one more look
+                self.sleep(1.0)
+                again = white_number(self.shot(), region)
             if again != val:  # a one-off misread (e.g. 1.7M read as 17M) must never trigger a purchase
                 self.log(f"{cur.title()} read {val:,} then {again} - not sure, skipping this time.", "warn")
                 continue
@@ -2036,8 +2088,8 @@ class Bot:
                 k = f.shape[1] / 1920  # bar layout is fixed: Remove Wall, Add +10, Add +1, gold Upgrade, elixir Upgrade
                 self.tap((pair[0][0] - int(612 * k), pair[0][1] + int(12 * k)), 0.7)
             self.tap(btn, 1.2)
+        ok = self.wait_for("wall_okay_button", 3 if want is None else 1)  # it animates in (slower at 30 FPS)
         frame = self.shot()
-        ok = self.find(frame, "wall_okay_button")
         if ok:  # 'Upgrade Walls' dialog: check it says Walls + this currency + a price, never gems
             h, w = frame.shape[:2]
             try:
@@ -2172,7 +2224,7 @@ class Bot:
         else:  # never a blind tap: Back closes the popup (the bonus is already credited)
             self.adb.back()
             self.sleep(1.5)
-        self.log(f"Builder Base: Star Bonus collected ({name}).", "ok")
+        self.log(f"Star Bonus collected ({name}).", "ok")
         return True
 
     def bb_clock_boost(self):
@@ -2258,9 +2310,16 @@ class Bot:
         self.emit("state", f"Builder Base ({name})")
         self.bb_collect()
         self.bb_clock_boost()  # first, while the arrival view shows the whole base (its bubble is on the tower)
+        self.bb_session(name, upgrades=True)
+        self.take_boat("home")  # the boat view also shows the Elixir Cart: collect it (new defense rewards) first
+        return True
+
+    def bb_session(self, name, upgrades=True):
+        """On the Builder Base: upgrades, attacks until today's Star Bonuses are collected, upgrades again (the loot
+        may pay for more). Builder Base attacks only pay out through the Star Bonus - after that, nothing."""
         c = self.cfg
-        for rnd in range(2):  # upgrades before AND after the attacks (the loot may pay for more)
-            for kind in ("bb_builder", "bb_lab"):
+        for rnd in range(2):
+            for kind in ("bb_builder", "bb_lab") if upgrades else ():
                 if c["bb_builder_upgrades" if kind == "bb_builder" else "bb_lab_upgrades"]:
                     for _ in range(3):
                         if not self.free_slots(self.shot(), kind):
@@ -2270,46 +2329,75 @@ class Bot:
                         self.upgrade_from_list(kind)
                         if self.stats["upgrades"] == n:
                             break
-            if rnd or not c["bb_attacks_enabled"]:
+            if rnd or not (c["bb_attacks_enabled"] or self.mode.startswith("bb_")):
                 break
-            last = None
-            # Star Bonus: a popup each time the counter fills, several times a day. Once they're used up the counter
-            # just rolls over with no popup - then this account is done until tomorrow.
-            for _ in range(12):
-                if self.cfg["bb_bonus_days"].get(name) == time.strftime("%Y-%m-%d"):
-                    self.log("Builder Base: no Star Bonus left today - no attacks.")
-                    break
-                if self.bb_bonus(name):
-                    last = None  # the counter restarts after a bonus: that's not a 'rolled over without one'
-                f = self.shot()
-                if not self.find(f, "bb_attack_button"):  # still in a battle / its end screen: never press Back here
-                    done = self.wait_for("bb_return_home", 240, poll=3)
-                    if done:
-                        self.tap(done, 3.0)
-                    if not self.wait_for("bb_attack_button", 15):
-                        self.log("Builder Base: not back on the village - stopping the attacks.", "warn")
-                        break
-                    f = self.shot()
-                st = self.bb_stars(f)
-                if not st:  # the counter disappears from the Attack button once today's bonuses are all used
-                    if name != "?":
-                        self.cfg["bb_bonus_days"][name] = time.strftime("%Y-%m-%d")
-                        save_config(self.cfg)
-                    self.log("Builder Base: all of today's Star Bonuses collected - done until tomorrow.", "ok")
-                    break
-                if last and st[0] < last[0]:  # rolled over with no popup: today's bonus was already taken
-                    if name != "?":
-                        self.cfg["bb_bonus_days"][name] = time.strftime("%Y-%m-%d")
-                        save_config(self.cfg)
-                    self.log("Builder Base: star counter rolled over without a bonus - done for today.", "ok")
-                    break
-                last = st
-                self.log(f"Builder Base: stars {st[0]}/{st[1]} - attacking.")
-                self.bb_attack()
+            self.bb_attacks(name)
             self._upgrade_backoff.pop("bb_builder", None)
             self._upgrade_backoff.pop("bb_lab", None)
-        self.take_boat("home")  # the boat view also shows the Elixir Cart: collect it (new defense rewards) first
-        return True
+
+    def bb_done_today(self, name):
+        return self.cfg["bb_bonus_days"].get(name) == time.strftime("%Y-%m-%d")
+
+    def bb_attacks(self, name):
+        """Attack until today's Star Bonuses are all collected."""
+        last = None
+        # Star Bonus: a popup each time the counter fills, several times a day. Once they're used up the counter
+        # just rolls over with no popup - then this account is done until tomorrow.
+        for _ in range(12):
+            if self.bb_done_today(name):
+                self.log("Builder Base: no Star Bonus left today - no attacks.")
+                break
+            if self.bb_bonus(name):
+                last = None  # the counter restarts after a bonus: that's not a 'rolled over without one'
+            f = self.shot()
+            if not self.find(f, "bb_attack_button"):  # still in a battle / its end screen: never press Back here
+                done = self.wait_for("bb_return_home", 240, poll=3)
+                if done:
+                    self.tap(done, 3.0)
+                if not self.wait_for("bb_attack_button", 15):
+                    self.log("Builder Base: not back on the village - stopping the attacks.", "warn")
+                    break
+                f = self.shot()
+            st = self.bb_stars(f)
+            if not st:  # the counter disappears from the Attack button once today's bonuses are all used
+                if name != "?":
+                    self.cfg["bb_bonus_days"][name] = time.strftime("%Y-%m-%d")
+                    save_config(self.cfg)
+                self.log("Builder Base: all of today's Star Bonuses collected - done until tomorrow.", "ok")
+                break
+            if last and st[0] < last[0]:  # rolled over with no popup: today's bonus was already taken
+                if name != "?":
+                    self.cfg["bb_bonus_days"][name] = time.strftime("%Y-%m-%d")
+                    save_config(self.cfg)
+                self.log("Builder Base: star counter rolled over without a bonus - done for today.", "ok")
+                break
+            last = st
+            self.log(f"Builder Base: stars {st[0]}/{st[1]} - attacking.")
+            self.bb_attack()
+
+    def bb_only(self):
+        """'Builder Base only' modes: stay on the Builder Base. 'bb_farm' also keeps its builders + Star Lab busy
+        (following the planner); 'bb_loot' doesn't upgrade. Attack for today's Star Bonuses first; once they're done,
+        attacks still fill the Elixir Cart - so keep attacking in rounds of 10, collecting the cart after each
+        round, and move on to the next account between rounds when rotating."""
+        name = self.account_name(self.shot())
+        self.emit("state", f"Builder Base only ({name})")
+        self.bb_bonus(name)
+        self.bb_collect()
+        self.bb_clock_boost()
+        self.bb_session(name, upgrades=self.mode == "bb_farm")
+        if not self.bb_done_today(name):
+            return  # attacks stopped for another reason (screen, battle): look again
+        self.log(f"Builder Base only: Star Bonuses done ({name}) - attacking on to fill the Elixir Cart.")
+        for _ in range(10):
+            if not self.find(self.shot(), "bb_attack_button"):
+                if not self.wait_for("bb_attack_button", 20):
+                    return  # not back on the village: the main loop sorts the screen out
+            self.bb_attack()
+        self.bb_collect()  # the cart (and collectors) - its window has the green Collect
+        if self.cfg["rotate_accounts"] and time.time() >= self._rotate_pause_until:
+            self._switch_streak = 0  # every account always has more to farm here: never 'all done'
+            self.switch_account()
 
     def reload_if_disconnected(self, frame):
         """'Anyone there? You have been disconnected due to inactivity' -> RELOAD GAME, then wait for it to load."""
@@ -2433,6 +2521,13 @@ class Bot:
             self._upgrade_backoff[kind] = time.time() + 600
             self.back_to_village(icon)
             return self.log(f"{KIND_NAMES[kind]}: lost '{nm}' after re-opening the list - will retry.", "warn")
+        for _ in range(6):  # the list glides on after a swipe: tap only once two reads agree where the row is
+            self.sleep(0.4)
+            again = [r for r in list_rows(self.shot()) if r[1] == price and r[2] and name_match(r[0], nm)]
+            if again and abs(again[0][3][1] - match[0][3][1]) <= 4:
+                match = again
+                break
+            match = again or match
         self.tap(match[0][3], 1.6)
         if self.find(self.shot(), "guardians_title"):
             f, k = self.shot(), self.shot().shape[1] / 1920
@@ -2694,7 +2789,7 @@ class Bot:
         self.back_to_village()
         f = self.shot()
         k = f.shape[1] / 1920
-        self.tap(self.find(f, "settings_cog_button") or (int(1842 * k), int(765 * k)), 1.5)
+        self.tap(self.find(f, "settings_cog_button") or (int(1842 * k), int(765 * k)), 0.6)
         # strict matches only: a looser one takes look-alike green buttons (Credits, Change Name...)
         more = None
         for _ in range(6):
@@ -2705,21 +2800,26 @@ class Bot:
                 near = n and difflib.get_close_matches(n.lower(), [x.lower() for x in self._names], 1, 0.75)
                 self._settings_name = next((x for x in self._names if near and x.lower() == near[0]), n)
                 break
-            self.sleep(0.8)
+            self.sleep(0.5)
         data = None
         if more:
-            self.tap(more, 2.0)  # let the window finish opening before anything touches it
+            self.tap(more, 0.8)
+            for _ in range(8):  # touch nothing until the More Settings window has finished opening
+                if self.v.find(self.shot(), "more_settings_button", 0.9) is None:
+                    break
+                self.sleep(0.3)
+            self.sleep(0.5)
             hit = None
             for _ in range(10):  # the page opens wherever it was last scrolled to (the top after a game start)
                 f = self.shot()
                 hit = self.v.find(f, "export_copy_row", 0.9)  # the Change Name row scores ~0.75
-                y = None if hit else settings_drag_start(f)
-                if y is None:
+                if hit:
                     break
-                # SLOW drag from a grey section header, never from a row: a touch on a row that doesn't turn
-                # into a scroll presses it (flips a setting, opens Change Name...)
-                self.adb.swipe(int(500 * k), y, int(500 * k), max(int(20 * k), y - int(400 * k)), 1200)
-                self.sleep(1.2)
+                # SLOW drag from a grey section header if one is low on the page, else from the setting NAMES at
+                # the rows' left (plain text) - never the buttons on the right, which a touch would press
+                y = settings_drag_start(f) or int(880 * k)
+                self.adb.swipe(int(500 * k), y, int(500 * k), max(int(160 * k), y - int(650 * k)), 700)
+                self.sleep(0.8)
             if hit:
                 self.tap((hit[0] + int(398 * k), hit[1]), 1.0)  # the green Copy button at the row's right
                 for _ in range(5):
@@ -2862,7 +2962,8 @@ class Bot:
         return True
 
     def list_accounts(self, frame):
-        """Account names on the Supercell ID panel: the bold name that has a 'Town Hall' line under it."""
+        """Rows of the Supercell ID panel on screen: [{'sc': Supercell ID name, 'game': in-game name (rough OCR),
+        'th': Town Hall, 'xy': where to tap}] - a row is the bold name with a 'Town Hall: N' line under it."""
         x0 = frame.shape[1] * 2 // 3
         try:
             d = pytesseract.image_to_data(cv2.cvtColor(frame[:, x0:], cv2.COLOR_BGR2GRAY), config="--psm 11",
@@ -2871,9 +2972,76 @@ class Bot:
             return []
         words = [(t.strip(), x0 + d["left"][i] + d["width"][i] // 2, d["top"][i] + d["height"][i] // 2)
                  for i, t in enumerate(d["text"]) if t.strip()]
-        towns = [(x, y) for t, x, y in words if t.lower() == "town"]
-        return [(t, (x, y)) for t, x, y in words
-                if any(abs(tx - x) < 90 and 40 < ty - y < 75 for tx, ty in towns)]
+        self._list_end = any(t.upper() == "OTHER" for t, _, _ in words)  # 'OTHER IDS': the list ends above it
+        rows = []
+        for tw, tx, ty in [(t, x, y) for t, x, y in words if t.lower() == "town"]:
+            name = next(((t, x, y) for t, x, y in words if abs(tx - x) < 90 and 40 < ty - y < 75), None)
+            if not name:
+                continue
+            th = next((t for t, x, y in words if abs(y - ty) < 6 and 0 < x - tx < 160 and t.isdigit()), None)
+            game = next((t for t, x, y in words if 15 < y - name[2] < 40 and 0 < x - name[1] < 140
+                         and len(t) > 2), "")
+            rows.append({"sc": name[0], "game": game, "th": int(th) if th else None, "xy": (name[1], name[2])})
+        return rows
+
+    def all_accounts(self):
+        """Every account on the Supercell ID panel, top to bottom, scrolling down for long lists (10+ accounts).
+        Returns (rows, the panel's last view)."""
+        seen, frame = {}, self.shot()
+        k = frame.shape[1] / 1920
+        for _ in range(8):
+            new = [r for r in self.list_accounts(frame) if r["sc"] not in seen]
+            for r in new:
+                seen[r["sc"]] = r
+            if not new or self._list_end:
+                break
+            self.adb.swipe(int(1620 * k), int(960 * k), int(1620 * k), int(620 * k), 700)  # inside the panel
+            self.sleep(1.2)
+            frame = self.shot()
+        return list(seen.values())
+
+    def tap_account(self, sc):
+        """Scroll the Supercell ID panel back to the top, then down until that account is on screen; tap it."""
+        f = self.shot()
+        k = f.shape[1] / 1920
+        if not any(r["sc"] == sc for r in self.list_accounts(f)):  # not on screen: back to the top first
+            for _ in range(4):
+                self.adb.swipe(int(1620 * k), int(600 * k), int(1620 * k), int(1000 * k), 400)
+            self.sleep(1.0)
+        for _ in range(8):
+            row = next((r for r in self.list_accounts(self.shot()) if r["sc"] == sc), None)
+            if row:
+                self.tap(row["xy"], 4.0)
+                return True
+            self.adb.swipe(int(1620 * k), int(960 * k), int(1620 * k), int(620 * k), 700)
+            self.sleep(1.2)
+        return False
+
+    @staticmethod
+    def same_game_name(a, b):
+        """Two OCR'd in-game names ('Geocoi2' / 'GeoCol2') are the same name: same digits, close spelling."""
+        n = lambda s: re.sub(r"[^a-z0-9]", "", s.lower().replace("i", "l").replace("0", "o"))
+        return bool(a and b) and re.sub(r"\D", "", a) == re.sub(r"\D", "", b) and \
+            difflib.SequenceMatcher(None, n(a), n(b)).ratio() >= 0.7
+
+    def account_key(self, row, rows, name):
+        """What this account's plans / scans are filed under: its in-game name - or, when another account on the
+        list has the same in-game name, 'name (Supercell ID)'. Moves old data filed under the bare name to it
+        when the Town Hall matches."""
+        if not any(r is not row and self.same_game_name(r["game"], row["game"]) for r in rows):
+            return None
+        key = f"{name} ({row['sc']})"
+        old = ((self.cfg.get("scans") or {}).get(name) or {}).get("home") or {}
+        if old and row["th"] and old.get("hall") == row["th"] and key not in (self.cfg.get("scans") or {}):
+            for part in ("scans", "plans", "bb_bonus_days"):
+                if name in (self.cfg.get(part) or {}):
+                    self.cfg[part][key] = self.cfg[part].pop(name)
+            for tag, n in list((self.cfg.get("account_tags") or {}).items()):
+                if n == name:
+                    self.cfg["account_tags"][tag] = key
+            save_config(self.cfg)
+            self.log(f"Two accounts are called '{name}': this one's planner data is now under '{key}'.", "ok")
+        return key
 
     def switch_account(self):
         """Settings cog -> blue switch button -> tap the next account on the Supercell ID list."""
@@ -2892,29 +3060,54 @@ class Bot:
         cog = self.find(frame, "settings_cog_button") or (int(1842 * k), int(765 * k))
         self.tap(cog, 2.0)
         sw = self.wait_for("switch_account_button", 5)
+        tag = settings_tag(self.shot()) if sw else None
+        sc_of = self.cfg.setdefault("sc_of_tag", {})
+        if tag and getattr(self, "_cur_sc", None):
+            if sc_of.get(tag) != self._cur_sc:
+                sc_of[tag] = self._cur_sc  # this account = that Supercell ID (exact, unlike the in-game name)
+                save_config(self.cfg)
+        elif tag:
+            self._cur_sc = next((sc for t, sc in sc_of.items() if same_tag(t, tag)), None)
         if not sw:
             return self.switch_fail("switch-account button not found")
         self.tap(sw, 2.5)
         if not self.wait_for("supercell_id_header", 6):
             return self.switch_fail("Supercell ID list didn't open")
-        accounts = self.list_accounts(self.shot())
+        rows = self.all_accounts()
         wanted = {a.strip().lower() for a in self.cfg["accounts"].split(",") if a.strip()}
         if wanted:
-            accounts = [a for a in accounts if a[0].lower() in wanted]
-        self._n_accounts = len(accounts)
-        if len(accounts) < 2:
-            return self.switch_fail(f"need 2+ accounts to rotate, found {[a[0] for a in accounts]}")
-        self._acc_idx = (self._acc_idx + 1) % len(accounts)
-        if accounts[self._acc_idx][0].lower() == (self._last_name or "").lower():  # that's the one we're on
-            self._acc_idx = (self._acc_idx + 1) % len(accounts)
-        name, xy = accounts[self._acc_idx]
+            rows = [r for r in rows if r["sc"].lower() in wanted]
+        self._n_accounts = len(rows)
+        if len(rows) < 2:
+            return self.switch_fail(f"need 2+ accounts to rotate, found {[r['sc'] for r in rows]}")
+        # the one we're on: known exactly after a switch; at the start, the row whose in-game name (and Town Hall,
+        # when two share a name) matches this account
+        scans = self.cfg.get("scans") or {}
+        acc = next((n for t, n in (self.cfg.get("account_tags") or {}).items() if same_tag(t, tag)), None)
+        hall = ((scans.get(acc or self._last_name) or {}).get("home") or {}).get("hall")
+        cur = next((i for i, r in enumerate(rows) if r["sc"] == getattr(self, "_cur_sc", None)), None)
+        if cur is None:
+            bare = re.sub(r" \(.*\)$", "", self._last_name or "")
+            if tag and acc is None:  # an account not seen before: not one of the known accounts' rows
+                known = {((scans.get(n) or {}).get("home") or {}).get("hall")
+                         for n in (self.cfg.get("account_tags") or {}).values()}
+                cur = next((i for i, r in enumerate(rows) if self.same_game_name(r["game"], bare)
+                            and r["th"] not in known), None)
+            else:
+                cur = next((i for i, r in enumerate(rows) if self.same_game_name(r["game"], bare)
+                            and (hall is None or r["th"] in (None, hall))), None)
+        self._acc_idx = ((cur if cur is not None else self._acc_idx) + 1) % len(rows)
+        row = rows[self._acc_idx]
+        name = row["sc"]
         self.log(f"Switching account -> {name}", "ok")
-        self._last_name, self._pre = None, None  # new account: re-read its name, don't mix its loot with the last
-        self.tap(xy, 4.0)
+        self._last_name, self._pre, self._sc_key = None, None, None  # new account: re-read its name
+        if not self.tap_account(name):
+            return self.switch_fail(f"couldn't find {name} on the Supercell ID list")
+        self._cur_sc = name
         end, backs = time.time() + 75, 0
         while time.time() < end:
             f = self.shot()
-            if self.find(f, "attack_button"):
+            if self.at_village(f):  # home OR Builder Base: an account opens on whichever village it was left on
                 self._switch_streak += 1
                 self._upgrade_backoff.clear()
                 self._bank_backoff.clear()
@@ -2928,7 +3121,10 @@ class Bot:
                         break
                     self.sleep(1.0)
                 self._last_name = self._last_name or name
-                self.emit("state", f"Home village ({name})")
+                self._sc_key = self.account_key(row, rows, self._last_name)  # two accounts with one in-game name
+                if self._sc_key:
+                    self._last_name = self._sc_key
+                self.emit("state", f"Home village ({self._last_name})")
                 return True
             if self.find(f, "wall_okay_button") or time.time() > end - 60 + 6 * (backs + 1):
                 self.adb.back()  # 'Welcome back' / news popups; Back never confirms anything
@@ -3163,28 +3359,62 @@ class Bot:
 # Phone view: read-only web page (live screen + stats), shared through the Anywhere link
 # ---------------------------------------------------------------------------
 PHONE_PAGE = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Loot Farmer</title><style>
-body{margin:0;background:#1c1c1c;color:#e6e6e6;font:15px system-ui,sans-serif;padding:14px}
-h1{font-size:20px;margin:0 0 2px}#state{color:#4cc38a;font-weight:600;margin-bottom:10px}
-img{width:100%;border-radius:10px;background:#141414;min-height:120px}
-.g{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:12px 0}
-.c{background:#2b2b2b;border-radius:10px;padding:10px}.c b{display:block;font-size:20px}
-.c span{color:#9a9a9a;font-size:12px;text-transform:uppercase}
-.gold{color:#f5c542}.elixir{color:#d77bff}
-#loot table{width:100%;border-collapse:collapse;margin-bottom:12px;font-size:13px}
-#loot td,#loot th{padding:6px;text-align:right;border-bottom:1px solid #333}#loot td:first-child,#loot th:first-child{text-align:left}
-#log{background:#141414;border-radius:10px;padding:10px;font:12px ui-monospace,monospace;white-space:pre-wrap}
-</style></head><body><h1>&#9876; Loot Farmer</h1><div id="state">&hellip;</div><img id="f">
-<div class="g" id="g"></div><div id="loot"></div><div id="log"></div><script>
-const T=[["battery","Battery"],["runtime","Runtime"],["attacks","Attacks"],["skipped","Skipped"],["walls","Walls"],
-["recoveries","Recoveries"],["errors","Errors"],["s_gold","Your gold","gold"],["s_elixir","Your elixir","elixir"],
-["upgrades","Upgrades"],["switches","Switches"],["b_gold","Base gold","gold"],["b_elixir","Base elixir","elixir"]];
-async function tick(){try{const s=await (await fetch("status"+location.search,{cache:"no-store"})).json();
-document.getElementById("state").textContent=s.state;
-document.getElementById("g").innerHTML=T.map(([k,l,c])=>`<div class="c"><span>${l}</span><b class="${c||""}">${s[k]??"-"}</b></div>`).join("");
-document.getElementById("log").textContent=s.log.join("\\n");
-const L=s.loot||[];document.getElementById("loot").innerHTML=L.length?"<table><tr><th>Account</th><th>Gold</th><th>/hr</th><th>Elixir</th><th>/hr</th><th>Dark</th><th>/hr</th></tr>"+L.map(r=>`<tr><td>${r[0]}</td><td class="gold">${r[1]}</td><td class="gold">${r[2]}</td><td class="elixir">${r[3]}</td><td class="elixir">${r[4]}</td><td>${r[5]}</td><td>${r[6]}</td></tr>`).join("")+"</table>":"";
-document.getElementById("f").src="frame.jpg"+location.search+"&t="+Date.now();}catch(e){document.getElementById("state").textContent="PC not reachable";}}
+<meta name="theme-color" content="#141414"><title>Loot Farmer</title><style>
+*{box-sizing:border-box}body{margin:0;background:#1c1c1c;color:#e6e6e6;font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:14px}
+header{display:flex;align-items:center;gap:10px;margin-bottom:12px}header img{height:42px}
+h1{font-size:19px;margin:0}.sub{color:#9a9a9a;font-size:12px}
+.pill{margin-left:auto;padding:6px 12px;border-radius:999px;font-weight:600;font-size:13px;background:#1f3a2c;color:#4cc38a;
+white-space:nowrap;max-width:46%;overflow:hidden;text-overflow:ellipsis}
+.pill.off{background:#3a1f1f;color:#ff6b6b}.pill.idle{background:#2b2b2b;color:#9a9a9a}
+#f{width:100%;border-radius:12px;background:#141414;min-height:140px;display:block}
+.row{display:grid;gap:8px;margin:10px 0}.r3{grid-template-columns:repeat(3,1fr)}.r2{grid-template-columns:repeat(2,1fr)}
+.r4{grid-template-columns:repeat(4,1fr)}
+.c{background:#2b2b2b;border-radius:12px;padding:10px;display:flex;align-items:center;gap:8px;min-width:0}
+.c img{height:28px;flex:none}.c .v{font-weight:700;font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.c .l{color:#9a9a9a;font-size:11px;text-transform:uppercase;letter-spacing:.03em}
+.s{flex-direction:column;align-items:flex-start;gap:2px;padding:8px 10px}.s .v{font-size:16px}
+.gold{color:#f5c542}.elixir{color:#d77bff}.dark{color:#b9a3ff}
+h2{font-size:12px;color:#9a9a9a;text-transform:uppercase;letter-spacing:.05em;margin:16px 2px 6px}
+.card{background:#2b2b2b;border-radius:12px;padding:10px 12px}
+.acc{display:flex;align-items:center;gap:6px;padding:6px 0;border-bottom:1px solid #353535;flex-wrap:wrap}.acc:last-child{border:0}
+.acc b{flex:1 1 100%;font-size:14px}.acc span{display:flex;align-items:center;gap:3px;font-weight:600;font-size:13px;margin-right:8px}
+.acc img{height:16px}
+.wall{padding:6px 0;border-bottom:1px solid #353535}.wall:last-child{border:0}.wall b{font-size:14px}
+.wall .n{color:#f5c542;font-weight:600;font-size:13px}.wall .ok{color:#4cc38a;font-weight:600;font-size:13px}
+.wall .m{color:#9a9a9a;font-size:12px}
+#log{background:#141414;border-radius:12px;padding:10px;font:12px ui-monospace,Consolas,monospace;white-space:pre-wrap;
+max-height:260px;overflow:auto}
+@media(max-width:420px){.r4{grid-template-columns:repeat(2,1fr)}}
+</style></head><body><div class="wrap">
+<header><img id="logo"><div><h1>Loot Farmer</h1><div class="sub" id="mode">&hellip;</div></div>
+<div class="pill idle" id="state">&hellip;</div></header>
+<img id="f" alt="">
+<div class="row r3" id="rates"></div>
+<div class="row r2" id="store"></div>
+<div class="row r4" id="g"></div>
+<h2>Accounts this session</h2><div class="card" id="loot"></div>
+<h2>Walls</h2><div class="card" id="walls"></div>
+<h2>Activity</h2><div id="log"></div>
+</div><script>
+const Q=location.search, ic=n=>"ui/"+n+".png"+Q, $=id=>document.getElementById(id);
+$("logo").src=ic("king");
+const STATS=[["runtime","Runtime"],["attacks","Attacks","king"],["walls","Walls","wall"],["upgrades","Upgrades","hammer"],
+["switches","Switches","builder_icon"],["skipped","Skipped","shield"],["recoveries","Restarts"],["battery","Battery"]];
+async function tick(){try{const s=await (await fetch("status"+Q,{cache:"no-store"})).json();
+const st=$("state");st.textContent=s.state;st.className="pill"+(/idle|stopped/i.test(s.state)?" idle":/recover/i.test(s.state)?" off":"");
+$("mode").textContent=s.mode?"Mode: "+s.mode:"";
+const R=s.rates||{};$("rates").innerHTML=[["gold","gold"],["elixir","elixir"],["dark","dark"]].map(([k,c])=>
+`<div class="c"><img src="${ic(k)}"><div style="min-width:0"><div class="v ${c}">${((R[k]||["—"])[0]).replace(" / h","").replace(/(\.\d)\dM/,"$1M")}</div><div class="l">per hour</div><div class="l" style="text-transform:none">${((R[k]||["",""])[1]).replace(" this session"," total")}</div></div></div>`).join("");
+$("store").innerHTML=[["s_gold","gold","gold"],["s_elixir","elixir","elixir"]].map(([k,i,c])=>
+`<div class="c"><img src="${ic(i)}"><div class="v ${c}">${s[k]??"—"}</div></div>`).join("");
+$("g").innerHTML=STATS.map(([k,l,i])=>`<div class="c s"><div class="l">${i?`<img src="${ic(i)}" style="height:14px;vertical-align:-2px"> `:""}${l}</div><div class="v">${s[k]??"-"}</div></div>`).join("");
+const L=s.loot||[];$("loot").innerHTML=L.length?L.map(r=>`<div class="acc"><b>${r[0]}</b>
+<span class="gold"><img src="${ic("gold")}">${r[1]}</span><span class="elixir"><img src="${ic("elixir")}">${r[3]}</span>
+<span class="dark"><img src="${ic("dark")}">${r[5]}</span><span><img src="${ic("king")}">${r[7]}</span></div>`).join(""):'<div class="sub">Shows up once farming starts.</div>';
+const W=s.walls_view||[];$("walls").innerHTML=W.length?W.map(w=>`<div class="wall"><b>${w[0]}</b><div class="${w[2]?"n":"ok"}">${w[1]}</div>${w[2]?`<div class="m">${w[2]}</div>`:""}</div>`).join(""):'<div class="sub">Scan an account in the planner to see its walls.</div>';
+$("log").textContent=(s.log||[]).join("\\n");
+$("f").src="frame.jpg"+Q+"&t="+Date.now();}catch(e){const st=$("state");st.textContent="PC not reachable";st.className="pill off";}}
 tick();setInterval(tick,1500);</script></body></html>"""
 
 
@@ -3203,6 +3433,13 @@ class PhoneView:
                     return
                 if path == "/frame.jpg":
                     body, ctype = view.jpeg, "image/jpeg"
+                elif re.fullmatch(r"/ui/[a-z_]+\.png", path):  # the page's Clash icons (wiki/ui)
+                    try:
+                        with open(os.path.join(WIKI_DIR, "ui", path[4:]), "rb") as fh:
+                            body, ctype = fh.read(), "image/png"
+                    except OSError:
+                        self.send_error(404)
+                        return
                 elif path == "/status":
                     body, ctype = json.dumps(view.status).encode(), "application/json"
                 else:
@@ -3297,6 +3534,7 @@ class Tunnel:
             return False
 
     def _run(self):
+        unconfirmed = 0  # new links in a row that never answered a check
         try:
             st = json.load(open(self.STATE))
         except Exception:
@@ -3317,12 +3555,21 @@ class Tunnel:
                     # a brand-new name takes a few seconds to exist; opening it before that gets 'site can't be
                     # reached' cached in the browser, so only hand the link out once it answers
                     if st:
-                        for _ in range(18):  # up to ~90s
+                        for _ in range(24):  # up to ~2 min
                             if self._link_works(st["url"]):
+                                unconfirmed = 0
                                 break
                             time.sleep(5)
-                        else:  # can't confirm it (our own check may be what's failing): hand it out anyway
-                            log_file.warning(f"New Anywhere link {st['url']} didn't answer a check yet.")
+                        else:  # never answered: don't post a dead link - a fresh tunnel (twice), then give up
+                            unconfirmed += 1
+                            if unconfirmed <= 2:
+                                log_file.warning(f"New Anywhere link {st['url']} never answered - starting another.")
+                                self._kill(st)
+                                st = None
+                            else:  # our own check may be what's failing (no internet?): hand it out anyway
+                                log_file.warning(f"Anywhere link {st['url']} couldn't be confirmed - posting it "
+                                                 "anyway.")
+                                unconfirmed = 0
                     if not st:
                         time.sleep(30)
                         continue
@@ -3350,6 +3597,7 @@ class Tunnel:
     def _link_works(url):
         """True: our server answers through the tunnel. False: Cloudflare says it's gone (name doesn't exist /
         530). None: can't tell (no internet, VPN reconnecting...) - never a reason to throw a working link away."""
+        import socket
         host = url.split("//", 1)[-1].split("/")[0]
         try:  # ask Cloudflare's DNS directly: a lookup through Windows would cache 'no such name' for minutes
             r = json.load(urllib.request.urlopen(urllib.request.Request(
@@ -3358,12 +3606,14 @@ class Tunnel:
             if r.get("Status") == 3 or (r.get("Status") == 0 and not r.get("Answer")):  # 3 = no such name
                 return False
         except Exception:
-            return None
+            pass  # that lookup service is blocked on some networks / antivirus: just try the link itself
         try:
             urllib.request.urlopen(url + "/status", timeout=15).close()
             return True
         except urllib.error.HTTPError as e:
             return e.code not in (502, 530, 1033)
+        except urllib.error.URLError as e:
+            return False if isinstance(e.reason, socket.gaierror) else None  # name doesn't exist = dead link
         except Exception:
             return None
 
@@ -3590,6 +3840,12 @@ def battery():
 # UI
 # ---------------------------------------------------------------------------
 BG, CARD, MUTED, TEXT = "#1c1c1c", "#2b2b2b", "#9a9a9a", "#e6e6e6"
+SIDE, NAV_ON = "#141414", "#262b33"  # sidebar, selected page
+# what the mode picker shows: mode -> (title, one line, icon in wiki/ui)
+MODES = {"farm": ("Full farm", "Attacks, upgrades, walls", "king"), "loot": ("Loot only", "Just attack", "gold"),
+         "walls": ("Walls only", "Farm + buy walls", "wall"),
+         "bb_loot": ("BB loot", "Builder Base: bonus + cart", "bgold"),
+         "bb_farm": ("BB farm", "Builder Base + upgrades", "builderhall")}
 GREEN, AMBER, RED, BLUE, GOLD, PINK = "#4cc38a", "#e5b454", "#ff6b6b", "#57a6ff", "#f5c542", "#d77bff"
 LEVEL_COLORS = {"info": TEXT, "ok": GREEN, "warn": AMBER, "err": RED}
 UI_SCALE = 1.0  # set from the real DPI at startup so the layout isn't tiny on 150-200% displays
@@ -3744,7 +4000,7 @@ class PlannerTab(ttk.Frame):
         self.qtitle.pack(anchor="w")
         ttk.Label(q, text="Top = upgraded first. Done targets drop off\nby themselves.", style="Sub.TLabel").pack(
             anchor="w", pady=S(2, 6))
-        self.qbox = self._scroller(q, S(330))
+        self.qbox = self._scroller(q, S(290))
         ttk.Button(q, text="Clear this account's plan", command=self.clear).pack(anchor="w", pady=S(8, 0))
         # right: cards
         r = ttk.Frame(body)
@@ -3917,9 +4173,12 @@ class PlannerTab(ttk.Frame):
         self._cards = {}
         self._empty = self._lbl(self.cards, "Nothing to show - scan the account first (or change the filter).",
                                 muted=True, bg=BG)
+        self.update_idletasks()
+        avail = self.cards.canvas.winfo_width()
+        self._ncols = 3 if avail >= S(1000) or avail <= 100 else 2  # 2 columns when the window is narrower
         for c in range(3):
-            self.cards.columnconfigure(c, weight=1, uniform="card")
-        self._card_w = self._col_width(self.cards.canvas.winfo_width())  # chips wrap inside it
+            self.cards.columnconfigure(c, weight=1 if c < self._ncols else 0, uniform="card" if c < self._ncols else "")
+        self._card_w = self._col_width(avail)  # chips wrap inside it
         for k in g:
             if k == "home:wall":
                 continue  # bought with gold/elixir, not builders: the dashboard's Walls card
@@ -3944,15 +4203,15 @@ class PlannerTab(ttk.Frame):
                       key=lambda k: (order.index(cards[k]["cat"]) if cards[k]["cat"] in order else 99,
                                      cards[k]["name"]))
         for n, k in enumerate(keys):
-            cards[k]["frame"].grid(row=n // 3, column=n % 3, sticky="nsew", padx=S(4), pady=S(4))
+            cards[k]["frame"].grid(row=n // self._ncols, column=n % self._ncols, sticky="nsew", padx=S(4), pady=S(4))
         if not keys:
             self._empty.grid(row=0, column=0, columnspan=3, sticky="w", pady=S(10))
         self.update_chips()
         self.cards.canvas.yview_moveto(0)
 
-    @staticmethod
-    def _col_width(avail):
-        return max(S(220), avail // 3 - S(12)) if avail > 100 else S(300)
+    def _col_width(self, avail):
+        cols = 3 if avail >= S(1000) or avail <= 100 else 2
+        return max(S(220), avail // cols - S(12)) if avail > 100 else S(300)
 
     def _resized(self, e):
         """Window resized (or first laid out): rebuild the cards at the new column width, once it settles."""
@@ -4158,6 +4417,10 @@ class App(tk.Tk):
         global UI_SCALE
         UI_SCALE = self.winfo_fpixels("1i") / 96
         self.title("Loot Farmer")
+        try:  # the King on the title bar + taskbar (same as the Start menu / desktop shortcut)
+            self.iconbitmap(default=os.path.join(WIKI_DIR, "ui", "app.ico"))
+        except tk.TclError:
+            pass
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{min(S(1240), int(sw * .92))}x{min(S(800), int(sh * .85))}+{int(sw * .04)}+{int(sh * .03)}")
         self.minsize(min(S(1060), int(sw * .8)), min(S(680), int(sh * .7)))
@@ -4222,6 +4485,9 @@ class App(tk.Tk):
     def _styles(self):
         s = ttk.Style(self)
         f = "Segoe UI Variable Display" if "Segoe UI Variable Display" in self.tk.call("font", "families") else "Segoe UI"
+        self._font = f
+        s.layout("Hidden.TNotebook.Tab", [])  # pages switch from the sidebar, not a tab row
+        s.configure("Hidden.TNotebook", borderwidth=0)
         s.configure("Title.TLabel", font=(f, 20, "bold"))
         s.configure("Sub.TLabel", font=("Segoe UI", 10), foreground=MUTED)
         s.configure("CardTitle.TLabel", font=("Segoe UI", 9, "bold"), foreground=MUTED)
@@ -4251,65 +4517,132 @@ class App(tk.Tk):
         return t
 
     # --- layout ---
+    # --- layout ---
+    def ui_icon(self, name, size):
+        """A Clash icon from wiki/ui/ (from the wiki) at that height, cached; None if missing."""
+        cache = self.__dict__.setdefault("_ui_icons", {})
+        if (name, size) not in cache:
+            try:
+                im = Image.open(os.path.join(WIKI_DIR, "ui", f"{name}.png")).convert("RGBA")
+                im = im.resize((max(1, round(im.width * size / im.height)), size), Image.LANCZOS)
+                cache[(name, size)] = ImageTk.PhotoImage(im)
+            except Exception:
+                cache[(name, size)] = None
+        return cache[(name, size)]
+
     def _build(self):
-        head = ttk.Frame(self, padding=S(24, 18, 24, 6))
-        head.pack(fill="x")
-        left = ttk.Frame(head)
-        left.pack(side="left")
-        ttk.Label(left, text="⚔  Loot Farmer", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(left, text="Clash of Clans  ·  unattended resource farming", style="Sub.TLabel").pack(anchor="w")
-        if self.phone:
-            self.public_label = ttk.Label(left, text="🌍  Anywhere link: starting…" if self.tunnel else
-                                          "🌍  Anywhere link: add cloudflared.exe next to bot.py",
-                                          style="Sub.TLabel", foreground=BLUE if self.tunnel else MUTED,
-                                          cursor="hand2")
-            self.public_label.pack(anchor="w")
-            self.public_label.bind("<Button-1>", lambda e: self.public_url and self._copy(
-                self.public_url, "Anywhere link"))
-        rep = ttk.Label(left, text="🐞  Send debug report to Discord", style="Sub.TLabel", foreground=BLUE,
-                        cursor="hand2")
-        rep.pack(anchor="w")
-        rep.bind("<Button-1>", lambda e: self.send_report("sent by hand"))
-        ver = ttk.Label(left, text=f"🕘  Version {APP_VERSION} - switch version", style="Sub.TLabel", foreground=BLUE,
-                        cursor="hand2")
-        ver.pack(anchor="w")
-        ver.bind("<Button-1>", lambda e: self.pick_version())
+        """Sidebar (navigation + connection + links) | main area: mode picker + Start, then the page."""
+        side = tk.Frame(self, bg=SIDE, width=S(236))
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        logo = tk.Frame(side, bg=SIDE)
+        logo.pack(fill="x", padx=S(16), pady=S(18, 14))
+        tk.Label(logo, image=self.ui_icon("king", S(44)), bg=SIDE).pack(side="left")
+        lt = tk.Frame(logo, bg=SIDE)
+        lt.pack(side="left", padx=S(10, 0))
+        tk.Label(lt, text="Loot Farmer", bg=SIDE, fg=TEXT, font=(self._font, 15, "bold")).pack(anchor="w")
+        tk.Label(lt, text=f"version {APP_VERSION}", bg=SIDE, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
 
-        right = ttk.Frame(head)
-        right.pack(side="right")
-        self.start_btn = ttk.Button(right, text="▶  Start farming", style="Start.Accent.TButton",
-                                    command=self.toggle, width=18)
-        self.start_btn.pack(side="right", padx=S(14, 0))
-        ttk.Button(right, text="⟳  Restart", command=self.restart_app).pack(side="right", padx=S(10, 0))
-        self.update_btn = ttk.Button(left, text="⬆  Update available - click to update", style="Accent.TButton",
-                                     command=self.do_update)  # under the title: the right-hand row is full
+        self.nav = {}
+        for page, label, icon in (("Dashboard", "Dashboard", "trophy"), ("Upgrade planner", "Upgrade planner", "builder"),
+                                  ("Setup", "Setup", "hammer"), ("Settings", "Settings", "lab"),
+                                  ("Log", "Activity log", "xp")):
+            row = tk.Frame(side, bg=SIDE, cursor="hand2", padx=S(12), pady=S(7))
+            row.pack(fill="x", padx=S(8), pady=S(1))
+            ic = tk.Label(row, image=self.ui_icon(icon, S(26)), bg=SIDE, width=S(30))
+            ic.pack(side="left")
+            tx = tk.Label(row, text=label, bg=SIDE, fg=TEXT, font=("Segoe UI", 11), anchor="w")
+            tx.pack(side="left", padx=S(10, 0))
+            for w in (row, ic, tx):
+                w.bind("<Button-1>", lambda e, p=page: self.nb.select(self.tabs[p]))
+            self.nav[page] = (row, ic, tx)
+
+        foot = tk.Frame(side, bg=SIDE)
+        foot.pack(side="bottom", fill="x", padx=S(16), pady=S(14))
+        self.update_btn = ttk.Button(foot, text="⬆  Update available", style="Accent.TButton", command=self.do_update)
         self._update = None  # shown only when GitHub has a newer version
-        self.loot_btn = ttk.Button(right, text="💰  Loot only", command=lambda: self.toggle("loot"))
-        self.loot_btn.pack(side="right", padx=S(10, 0))
-        self.wall_btn = ttk.Button(right, text="🧱  Walls only", command=lambda: self.toggle("walls"))
-        self.wall_btn.pack(side="right", padx=S(10, 0))
-        self.pill = ttk.Label(right, text="●  Connecting…", style="Pill.TLabel", foreground=AMBER)
-        self.batt_label = ttk.Label(right, text="", style="Pill.TLabel", foreground=MUTED)
-        self.batt_label.pack(side="right", padx=S(4, 10))
-        self._batt_t, self._batt_warned = 0.0, False
-        self.pill.pack(side="right", padx=S(14))
-        ttk.Button(right, text="↻", width=3, command=lambda: self.bg(self._initial_connect)).pack(side="right")
-        self.dev_combo = ttk.Combobox(right, width=15, state="readonly")
-        self.dev_combo.pack(side="right", padx=S(6))
-        self.dev_combo.bind("<<ComboboxSelected>>", self._device_chosen)
 
-        nb = self.nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=S(20), pady=S(8, 18))
-        tabs = {}
+        def link(text, cmd, color=BLUE):
+            lb = tk.Label(foot, text=text, bg=SIDE, fg=color, font=("Segoe UI", 9), cursor="hand2", anchor="w")
+            lb.pack(fill="x", pady=S(1))
+            lb.bind("<Button-1>", lambda e: cmd())
+            return lb
+        if self.phone:
+            self.public_label = link("🌍  Anywhere link: starting…" if self.tunnel else "🌍  Anywhere link: off",
+                                     lambda: self.public_url and self._copy(self.public_url, "Anywhere link"),
+                                     BLUE if self.tunnel else MUTED)
+        link("🐞  Send debug report", lambda: self.send_report("sent by hand"))
+        link("🕘  Switch version", self.pick_version)
+        link("⟳  Restart the app", self.restart_app)
+        tk.Frame(foot, bg="#2a2a2a", height=1).pack(fill="x", pady=S(10))
+        conn = tk.Frame(foot, bg=SIDE)
+        conn.pack(fill="x")
+        self.pill = tk.Label(conn, text="●  Connecting…", bg=SIDE, fg=AMBER, font=("Segoe UI", 10, "bold"))
+        self.pill.pack(side="left")
+        self.batt_label = tk.Label(conn, text="", bg=SIDE, fg=MUTED, font=("Segoe UI", 10, "bold"))
+        self.batt_label.pack(side="right")
+        self._batt_t, self._batt_warned = 0.0, False
+        dev = tk.Frame(foot, bg=SIDE)
+        dev.pack(fill="x", pady=S(6, 0))
+        self.dev_combo = ttk.Combobox(dev, width=16, state="readonly")
+        self.dev_combo.pack(side="left", fill="x", expand=True)
+        self.dev_combo.bind("<<ComboboxSelected>>", self._device_chosen)
+        ttk.Button(dev, text="↻", width=3, command=lambda: self.bg(self._initial_connect)).pack(side="left",
+                                                                                             padx=S(6, 0))
+
+        main = ttk.Frame(self)
+        main.pack(side="left", fill="both", expand=True)
+        top = ttk.Frame(main, padding=S(20, 16, 20, 4))
+        top.pack(fill="x")
+        self.start_btn = ttk.Button(top, text="▶  Start", style="Start.Accent.TButton", width=12,
+                                    command=lambda: self.toggle(self.mode_var.get()))
+        self.start_btn.pack(side="right", fill="y", padx=S(14, 0))
+        modes = tk.Frame(top, bg=BG)
+        modes.pack(side="left", fill="x", expand=True)
+        self.mode_var = tk.StringVar(value=self.cfg.get("ui_mode") if self.cfg.get("ui_mode") in MODES else "farm")
+        self.mode_cards = {}
+        for i, (m, (title, sub, icon)) in enumerate(MODES.items()):
+            modes.columnconfigure(i, weight=1, uniform="m")
+            card = tk.Frame(modes, bg=CARD, cursor="hand2", padx=S(6), pady=S(6), highlightthickness=S(2),
+                            highlightbackground=CARD, highlightcolor=CARD)
+            card.grid(row=0, column=i, sticky="nsew", padx=S(0 if i == 0 else 8, 0))
+            ic = tk.Label(card, image=self.ui_icon(icon, S(32)), bg=CARD)
+            ic.pack()
+            t = tk.Frame(card, bg=CARD)
+            t.pack(fill="x")
+            l1 = tk.Label(t, text=title, bg=CARD, fg=TEXT, font=("Segoe UI", 10, "bold"))
+            l1.pack()
+            l2 = tk.Label(t, text=sub, bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+            l2.pack()
+            for w in (card, ic, t, l1, l2):
+                w.bind("<Button-1>", lambda e, m=m: self.pick_mode(m))
+            self.mode_cards[m] = card
+        self.pick_mode(self.mode_var.get(), save=False)
+
+        nb = self.nb = ttk.Notebook(main, style="Hidden.TNotebook")  # pages; the sidebar is the tab row
+        nb.pack(fill="both", expand=True, padx=S(20), pady=S(8, 16))
+        self.tabs = tabs = {}
         for name in ("Dashboard", "Upgrade planner", "Setup", "Settings", "Log"):
-            tabs[name] = ttk.Frame(nb, padding=S(14) if name != "Upgrade planner" else 0)
-            nb.add(tabs[name], text=f"  {name}  ")
+            tabs[name] = ttk.Frame(nb, padding=S(4) if name != "Upgrade planner" else 0)
+            nb.add(tabs[name], text=name)
         self.planner_tab, self.planner = tabs["Upgrade planner"], None
         nb.bind("<<NotebookTabChanged>>", self._tab_changed)
         self._build_dashboard(tabs["Dashboard"])
         self._build_setup(tabs["Setup"])
         self._build_settings(tabs["Settings"])
         self._build_log(tabs["Log"])
+
+    def pick_mode(self, m, save=True):
+        if self.thread:  # can't change mode while running
+            return
+        self.mode_var.set(m)
+        for k, card in self.mode_cards.items():
+            on = k == m
+            card.config(highlightbackground=BLUE if on else CARD, highlightcolor=BLUE if on else CARD)
+        self.start_btn.config(text="▶  Start")
+        if save and self.cfg.get("ui_mode") != m:
+            self.cfg["ui_mode"] = m
+            save_config(self.cfg)
 
     def _build_dashboard(self, tab):
         tab.columnconfigure(0, weight=3)
@@ -4318,16 +4651,21 @@ class App(tk.Tk):
         stats = ttk.Frame(tab)
         stats.grid(row=0, column=0, columnspan=2, sticky="ew", pady=S(0, 10))
         self.stat_labels = {}
-        for i, (key, title) in enumerate([("runtime", "Runtime"), ("attacks", "Attacks"),
-                                          ("skipped", "Bases skipped"), ("walls", "Walls bought"),
-                                          ("upgrades", "Upgrades"),
-                                          ("switches", "Switches"), ("recoveries", "Recoveries"),
-                                          ("errors", "Errors")]):
+        for i, (key, title, icon) in enumerate([("runtime", "Runtime", None), ("attacks", "Attacks", "king"),
+                                                ("skipped", "Skipped", "shield"), ("walls", "Walls", "wall"),
+                                                ("upgrades", "Upgrades", "hammer"), ("switches", "Switches", "builder_icon"),
+                                                ("recoveries", "Restarts", "battlemachine"), ("errors", "Errors", None)]):
             stats.columnconfigure(i, weight=1, uniform="s")
-            c = ttk.Frame(stats, style="Card.TFrame", padding=S(14, 8, 14, 8))  # compact: room for the cards below
+            c = tk.Frame(stats, bg=CARD, padx=S(12), pady=S(8))
             c.grid(row=0, column=i, sticky="nsew", padx=S(0 if i == 0 else 6, 0))
-            ttk.Label(c, text=title.upper(), style="CardTitle.TLabel").pack(anchor="w")
-            self.stat_labels[key] = ttk.Label(c, text="0" if key != "runtime" else "—", style="Big.TLabel")
+            t = c
+            hd = tk.Frame(c, bg=CARD)
+            hd.pack(anchor="w")
+            if icon:
+                tk.Label(hd, image=self.ui_icon(icon, S(20)), bg=CARD).pack(side="left", padx=S(0, 5))
+            tk.Label(hd, text=title.upper(), bg=CARD, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
+            self.stat_labels[key] = tk.Label(t, text="0" if key != "runtime" else "—", bg=CARD, fg=TEXT,
+                                             font=(self._font, 17, "bold"))
             self.stat_labels[key].pack(anchor="w")
 
         live = self.card(tab, "Live view", row=1, column=0, padx=S(0, 6))
@@ -4344,7 +4682,7 @@ class App(tk.Tk):
             save_config(self.cfg)
             self.log("Builder Base " + ("on: each account gets a visit (collect, cart, upgrades, daily stars)."
                                         if self.bb_var.get() else "off."), "ok")
-        ttk.Checkbutton(top, text="🏗  Builder Base", variable=self.bb_var, command=bb_toggled,
+        ttk.Checkbutton(top, text="Full farm visits the Builder Base", variable=self.bb_var, command=bb_toggled,
                         style="Switch.TCheckbutton").pack(side="right")
         self.preview = tk.Canvas(live, bg="#141414", highlightthickness=0, height=S(240))
         self.preview.pack(fill="both", expand=True)
@@ -4356,24 +4694,37 @@ class App(tk.Tk):
         side.grid(row=1, column=1, sticky="nsew", padx=S(6, 0))
         side.columnconfigure(0, weight=1)
         side.rowconfigure(1, weight=1)
-        res = self.card(side, "Resources", row=0, column=0, pady=S(0, 12))
-        grid = ttk.Frame(res)
+        res = self.card(side, "Your storage", row=0, column=0, pady=S(0, 12))
+        grid = tk.Frame(res, bg=CARD)
         grid.pack(fill="x")
-        for i in range(4):
-            grid.columnconfigure(i, weight=1, uniform="r")
         self.res_labels = {}
-        for i, (key, label, col) in enumerate([("s_gold", "Your gold", GOLD), ("s_elixir", "Your elixir", PINK),
-                                               ("b_gold", "Last base gold", GOLD),
-                                               ("b_elixir", "Last base elixir", PINK)]):
-            cell = ttk.Frame(grid)
-            cell.grid(row=0, column=i, sticky="ew")
-            ttk.Label(cell, text=label, style="Muted.TLabel").pack(anchor="w")
-            self.res_labels[key] = ttk.Label(cell, text="—", foreground=col, style="Res.TLabel")
-            self.res_labels[key].pack(anchor="w")
-        lc = self.card(side, "Loot this session (per account)", row=1, column=0)
-        self.loot_tree = self._tree(lc, ("Account", "Gold", "Gold/hr", "Elixir", "Elixir/hr", "Dark", "Dark/hr", "Att."),
-                                    (84, 56, 58, 56, 62, 46, 56, 34), 4)
-        self.loot_tree.pack(fill="both", expand=True)
+        for i, (key, col, icon) in enumerate([("s_gold", GOLD, "gold"), ("s_elixir", PINK, "elixir")]):
+            grid.columnconfigure(i, weight=1, uniform="r")
+            cell = tk.Frame(grid, bg=CARD)
+            cell.grid(row=0, column=i, sticky="w")
+            tk.Label(cell, image=self.ui_icon(icon, S(32)), bg=CARD).pack(side="left", padx=S(0, 8))
+            self.res_labels[key] = tk.Label(cell, text="—", bg=CARD, fg=col, font=(self._font, 16, "bold"))
+            self.res_labels[key].pack(side="left")
+        lc = self.card(side, "This session", row=1, column=0)
+        rates = tk.Frame(lc, bg=CARD)
+        rates.pack(fill="x")
+        self.rate_labels = {}
+        for i, (key, col, icon) in enumerate([("gold", GOLD, "gold"), ("elixir", PINK, "elixir"),
+                                              ("dark", "#b9a3ff", "dark")]):
+            rates.columnconfigure(i, weight=1, uniform="rt")
+            cell = tk.Frame(rates, bg="#232323", padx=S(10), pady=S(8))
+            cell.grid(row=0, column=i, sticky="nsew", padx=S(0 if i == 0 else 6, 0))
+            tk.Label(cell, image=self.ui_icon(icon, S(30)), bg="#232323").pack(side="left", padx=S(0, 8))
+            t = tk.Frame(cell, bg="#232323")
+            t.pack(side="left")
+            per = tk.Label(t, text="—", bg="#232323", fg=col, font=(self._font, 15, "bold"))
+            per.pack(anchor="w")
+            tot = tk.Label(t, text="per hour", bg="#232323", fg=MUTED, font=("Segoe UI", 9))
+            tot.pack(anchor="w")
+            self.rate_labels[key] = (per, tot)
+        self.acc_box = tk.Frame(lc, bg=CARD)  # one line per account
+        self.acc_box.pack(fill="both", expand=True, pady=S(10, 0))
+        self.render_loot()
         wc = self.card(tab, "Walls", row=2, column=0, padx=S(0, 6), pady=S(12, 0))
         self.walls_cv = tk.Canvas(wc, bg=CARD, highlightthickness=0, height=S(40))
         self.walls_cv.pack(fill="x")
@@ -4576,7 +4927,7 @@ class App(tk.Tk):
                     self.loot_rows = data
                     self.render_loot()
                 elif kind == "base":
-                    for k, v in zip(("b_gold", "b_elixir"), data):
+                    for k, v in zip(("b_gold", "b_elixir"), data if "b_gold" in self.res_labels else ()):
                         self.res_labels[k].config(text="?" if v is None else f"{v:,}")
                 elif kind == "call":
                     data()
@@ -4609,6 +4960,9 @@ class App(tk.Tk):
             st = {k: lbl.cget("text") for k, lbl in {**self.stat_labels, **self.res_labels}.items()}
             st["battery"] = self.batt_label.cget("text").replace("🔋 ", "") or "-"
             st["loot"] = getattr(self, "loot_view", [])
+            st["rates"] = {k: [a.cget("text"), b.cget("text")] for k, (a, b) in self.rate_labels.items()}
+            st["walls_view"] = getattr(self, "walls_view", [])
+            st["mode"] = MODES[self.bot.mode if self.bot else self.mode_var.get()][0]
             st.update(state=self.state_label.cget("text"), log=list(self.recent))
             self.phone.status = st
         if self.started_at:
@@ -4617,8 +4971,8 @@ class App(tk.Tk):
         if self.thread and not self.thread.is_alive():
             self.thread = self.bot = None
             self.started_at = None
-            for btn, text in self.mode_buttons().values():
-                btn.config(text=text, state="normal")
+            self.start_btn.config(state="normal")
+            self.pick_mode(self.mode_var.get(), save=False)
 
     def _append_log(self, level, msg):
         ts = time.strftime("%H:%M:%S ")
@@ -4722,9 +5076,7 @@ class App(tk.Tk):
     def toggle(self, mode="farm"):
         if self.thread:
             self.bot.stop_evt.set()
-            for btn, _ in self.mode_buttons().values():
-                btn.config(state="disabled")
-            self.mode_buttons()[self.bot.mode][0].config(text="Stopping…")
+            self.start_btn.config(text="Stopping…", state="disabled")
             return
         miss = self.missing_setup()
         if miss:
@@ -4747,15 +5099,10 @@ class App(tk.Tk):
         if self.public_url:  # the start-up post can be missed (PC asleep, network not up yet): send it again
             url = self.public_url
             self.announce(f"▶️ Farming started on **{os.environ.get('COMPUTERNAME', 'a PC')}**\n{url}")
-        for m, (btn, _) in self.mode_buttons().items():
-            if m == mode:
-                btn.config(text={"farm": "■  Stop farming", "loot": "■  Stop looting", "walls": "■  Stop walls"}[m])
-            else:
-                btn.config(state="disabled")
-
-    def mode_buttons(self):
-        return {"farm": (self.start_btn, "▶  Start farming"), "loot": (self.loot_btn, "💰  Loot only"),
-                "walls": (self.wall_btn, "🧱  Walls only")}
+        self.start_btn.config(text="■  Stop")
+        for k, card in self.mode_cards.items():
+            if k != mode:
+                card.config(highlightbackground=CARD)
 
     def render_loot(self):
         """Per-account session loot + per-hour rates (loot / time since Start), with an all-accounts total."""
@@ -4768,12 +5115,28 @@ class App(tk.Tk):
             items.append(("All accounts", [sum(r[i] for _, r in items) for i in range(4)]))
         self.loot_view = [[acc, short(g), rate(g), short(e), rate(e), short(dk), rate(dk), n]
                           for acc, (g, e, dk, n) in items]
+        tot = [sum(r[i] for r in rows.values()) for i in range(4)]
+        for i, key in enumerate(("gold", "elixir", "dark")):
+            per, total = self.rate_labels[key]
+            per.config(text=f"{rate(tot[i])} / h" if hrs and rows else "—")
+            total.config(text=f"{short(tot[i])} this session" if rows else "per hour")
+        for w in self.acc_box.winfo_children():
+            w.destroy()
+        if not rows:
+            tk.Label(self.acc_box, text="Loot per account shows here once farming starts.", bg=CARD, fg=MUTED,
+                     font=("Segoe UI", 9)).pack(anchor="w")
+        for acc, (g, e, dk, n) in sorted(rows.items()):
+            row = tk.Frame(self.acc_box, bg=CARD, pady=S(3))
+            row.pack(fill="x")
+            tk.Label(row, text=acc, bg=CARD, fg=TEXT, font=("Segoe UI", 10, "bold"), width=12, anchor="w").pack(
+                side="left")
+            for v, icon, col in ((g, "gold", GOLD), (e, "elixir", PINK), (dk, "dark", "#b9a3ff"), (n, "king", TEXT)):
+                tk.Label(row, image=self.ui_icon(icon, S(18)), bg=CARD).pack(side="left", padx=S(10, 3))
+                tk.Label(row, text=str(v) if icon == "king" else short(v), bg=CARD, fg=col,
+                         font=("Segoe UI", 10, "bold")).pack(side="left")
         if hrs and hrs >= 0.05 and rows:  # from the first attack (~3 min): rough, sharpens as the session goes
             self.cfg["loot_rate"] = int(sum(r[0] + r[1] for r in rows.values()) / hrs)
             self.render_walls()
-        self.loot_tree.delete(*self.loot_tree.get_children())
-        for row in self.loot_view:
-            self.loot_tree.insert("", "end", values=row)
 
     def render_walls(self):
         """Per account: a bar of its walls by level (green = max for its Town Hall), what's left to pay and how
@@ -4791,7 +5154,8 @@ class App(tk.Tk):
             except Exception:
                 self._wall_icon = None
         tagged = set((self.cfg.get("account_tags") or {}).values())
-        y = 0
+        y, views = 0, []
+        self.walls_view = views  # the phone page shows the same lines
         for acc, bases in sorted((self.cfg.get("scans") or {}).items()):
             if tagged and acc not in tagged and difflib.get_close_matches(acc, tagged, 1, 0.75):
                 continue
@@ -4804,9 +5168,6 @@ class App(tk.Tk):
                 cv.create_image(0, y + S(2), image=self._wall_icon, anchor="nw")
             cv.create_text(x0, y, anchor="nw", fill=TEXT, font=("Segoe UI", 10, "bold"),
                            text=f"{acc}   ·   Town Hall {sd.get('hall') or '?'}")
-            cv.create_text(W - S(4), y, anchor="ne", font=("Segoe UI", 10, "bold"),
-                           fill=GREEN if not todo else GOLD, text="✓  every wall is max" if not todo else
-                           f"{short(cost)} to go" + (f"   ·   ≈ {cost / rate:,.1f} h" if rate else ""))
             by, bh, x = y + S(24), S(16), x0
             for lvl in sorted(counts):
                 w = (W - x0 - S(4)) * counts[lvl] / total
@@ -4817,12 +5178,22 @@ class App(tk.Tk):
                 if w > S(26):
                     cv.create_text(x + w / 2, by + bh / 2, text=str(lvl), fill="#111", font=("Segoe UI", 8, "bold"))
                 x += w
-            parts = "   ".join(f"lvl {lvl} ×{n}" for lvl, n in sorted(counts.items()) if lvl < (mx or 99))
-            eta = (f"hours at your farming rate of {short(rate)} gold + elixir / h" if rate else
-                   "start farming to estimate the hours") if todo else f"{total} walls at level {mx}"
-            cv.create_text(x0, by + bh + S(6), anchor="nw", fill=MUTED, font=("Segoe UI", 9),
-                           text=(f"{todo} of {total} walls to upgrade   ·   {parts}   ·   " if todo else "") + eta,
-                           width=W - x0)
+            hours = lambda v: f"≈ {v / rate:,.1f} h of farming" if rate else "start farming to estimate the hours"
+            if todo:  # headline: the next step - every wall at the lowest level up one level
+                low = min(counts)
+                n_low, step = counts[low], wiki_data()["home:wall"]["levels"][low]["cost"]
+                text = f"Next: {n_low} walls → level {low + 1}   ·   {short(n_low * step)}   ·   {hours(n_low * step)}"
+            else:
+                text = f"✓  all {total} walls at level {mx}"
+            head = cv.create_text(x0, by + bh + S(6), anchor="nw", font=("Segoe UI", 10, "bold"),
+                                  fill=GREEN if not todo else GOLD, width=W - x0, text=text)
+            views.append([f"{acc} · Town Hall {sd.get('hall') or '?'}", text, f"All {todo} to level {mx}: {short(cost)}"
+                          + (f" · {hours(cost)}" if rate else "") if todo else ""])
+            if todo:
+                cv.create_text(x0, cv.bbox(head)[3] + S(2), anchor="nw", fill=MUTED, font=("Segoe UI", 9),
+                               width=W - x0, text=f"All {todo} to level {mx} (max for this Town Hall): {short(cost)}"
+                               + (f"   ·   {hours(cost)}" if rate else "")
+                               + (f"   ·   at {short(rate)} gold + elixir / h" if rate else ""))
             y = cv.bbox("all")[3] + S(12)
         if not y:
             cv.create_text(0, 0, anchor="nw", fill=MUTED, font=("Segoe UI", 9),
@@ -4835,8 +5206,8 @@ class App(tk.Tk):
             lbl.config(text="0" if k != "runtime" else "0h 00m")
         for lbl in self.res_labels.values():
             lbl.config(text="—")
-        self.loot_tree.delete(*self.loot_tree.get_children())
         self.loot_rows, self.loot_view = {}, []
+        self.render_loot()
 
     def _update_tick(self):
         """Check GitHub for a newer version now and every 30 minutes."""
@@ -4850,7 +5221,7 @@ class App(tk.Tk):
     def _show_update(self, man):
         if not self._update:
             self.log(f"Update available: version {man['version']} (you have {APP_VERSION}). Click ⬆ Update.", "ok")
-            self.update_btn.pack(anchor="w", pady=S(6, 0))
+            self.update_btn.pack(fill="x", pady=S(0, 10), before=self.update_btn.master.winfo_children()[1])
         self._update = man
 
     def do_update(self):
@@ -4879,6 +5250,11 @@ class App(tk.Tk):
     def _tab_changed(self, _e=None):
         """The planner tab is built the first time it's opened (50+ cards: no need to slow the start-up)."""
         tab = self.nb.nametowidget(self.nb.select())
+        for page, ws in self.nav.items():
+            on = self.tabs[page] is tab
+            for w in ws:
+                w.config(bg=NAV_ON if on else SIDE)
+            ws[2].config(font=("Segoe UI", 11, "bold" if on else "normal"))
         if tab is self.planner_tab:
             if self.planner is None:
                 self.planner = PlannerTab(self, tab)
@@ -4959,6 +5335,11 @@ class App(tk.Tk):
             try:
                 with open(LOG_FILE, encoding="utf-8", errors="replace") as f:
                     files.append(("bot.log", hide.sub("k=<hidden>", "".join(f.readlines()[-400:])).encode()))
+            except OSError:
+                pass
+            try:  # what the Anywhere link's tunnel did (link problems)
+                with open(Tunnel.LOG, encoding="utf-8", errors="replace") as f:
+                    files.append(("cloudflared.log", "".join(f.readlines()[-80:]).encode()))
             except OSError:
                 pass
             for name in ("debug_deploy.png", "debug_wall.png", "debug_boat.png"):
@@ -5356,6 +5737,9 @@ def published_files():
         icons = os.path.join(WIKI_DIR, "icons")
         files += sorted(f"wiki/icons/{f}" for f in (os.listdir(icons) if os.path.isdir(icons) else [])
                         if f.endswith(".png"))
+        ui = os.path.join(WIKI_DIR, "ui")  # the app's own Clash icons (sidebar, modes, tiles)
+        files += sorted(f"wiki/ui/{f}" for f in (os.listdir(ui) if os.path.isdir(ui) else [])
+                        if f.endswith((".png", ".ico")))
     return files
 
 
@@ -5484,6 +5868,10 @@ if __name__ == "__main__":
     else:
         try:  # crisp text on scaled (125-200%) Windows displays
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+        try:  # its own taskbar identity: the King icon, not Python's (the shortcuts carry the same ID)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
         except Exception:
             pass
         _instance = single_instance()
