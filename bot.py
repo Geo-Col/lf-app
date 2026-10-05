@@ -72,7 +72,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 22  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 23  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2326,21 +2326,31 @@ class Bot:
         may pay for more). Builder Base attacks only pay out through the Star Bonus - after that, nothing."""
         c = self.cfg
         for rnd in range(2):
-            for kind in ("bb_builder", "bb_lab") if upgrades else ():
-                if c["bb_builder_upgrades" if kind == "bb_builder" else "bb_lab_upgrades"]:
-                    for _ in range(3):
-                        if not self.free_slots(self.shot(), kind):
-                            self.maybe_rescan(kind)
-                            break
-                        n = self.stats["upgrades"]
-                        self.upgrade_from_list(kind)
-                        if self.stats["upgrades"] == n:
-                            break
+            if upgrades:
+                self.bb_upgrades()
             if rnd or not (c["bb_attacks_enabled"] or self.mode.startswith("bb_")):
                 break
             self.bb_attacks(name)
             self._upgrade_backoff.pop("bb_builder", None)
             self._upgrade_backoff.pop("bb_lab", None)
+
+    def bb_upgrades(self):
+        """Keep the Builder Base builders + Star Lab busy: the next target in this account's plan (or wait for it),
+        else the most expensive thing affordable. True if any builder / the Star Lab is still free afterwards."""
+        free = False
+        for kind in ("bb_builder", "bb_lab"):
+            if not self.cfg["bb_builder_upgrades" if kind == "bb_builder" else "bb_lab_upgrades"]:
+                continue
+            for _ in range(3):
+                if not self.free_slots(self.shot(), kind):
+                    self.maybe_rescan(kind)
+                    break
+                n = self.stats["upgrades"]
+                self.upgrade_from_list(kind)
+                if self.stats["upgrades"] == n:
+                    free = True  # a slot is free but nothing was bought: saving up for it
+                    break
+        return free
 
     def bb_done_today(self, name):
         return self.cfg["bb_bonus_days"].get(name) == time.strftime("%Y-%m-%d")
@@ -2386,8 +2396,9 @@ class Bot:
     def bb_only(self):
         """'Builder Base only' modes: stay on the Builder Base.
         bb_loot: attack non-stop on this account, claiming the Elixir Cart every 10 attacks.
-        bb_farm: builders + Star Lab follow the planner, attacks for today's Star Bonuses, then rounds of 10 attacks
-        to fill the Elixir Cart, moving on to the next account between rounds when rotating."""
+        bb_farm: builders + Star Lab follow the planner (or upgrade anything, with no plan); attacks for today's
+        Star Bonuses, then rounds of 5 attacks + the Elixir Cart, checking the upgrades after each round - it stays
+        on the account until its next upgrade is bought, and only moves on (when rotating) once all are busy."""
         name = self.account_name(self.shot())
         self.emit("state", f"Builder Base only ({name})")
         self.bb_bonus(name)
@@ -2405,15 +2416,20 @@ class Bot:
             return  # attacks stopped for another reason (screen, battle): look again
         if getattr(self, "_bb_on_logged", None) != name:
             self._bb_on_logged = name
-            self.log(f"Builder Base only: Star Bonuses done ({name}) - attacking on to fill the Elixir Cart.")
-        for _ in range(10):
-            if not self.find(self.shot(), "bb_attack_button"):
-                if not self.wait_for("bb_attack_button", 20):
-                    return  # not back on the village: the main loop sorts the screen out
+            self.log(f"Builder Base farm: Star Bonuses done ({name}) - farming on for the next upgrade.")
+        # farm in short rounds, checking the upgrades after each: buys the plan's next target the moment it's
+        # affordable (or anything, with no plan)
+        for _ in range(5):
+            if not self.find(self.shot(), "bb_attack_button") and not self.wait_for("bb_attack_button", 20):
+                return  # not back on the village: the main loop sorts the screen out
             self.bb_attack()
-        self.bb_collect()  # the cart (and collectors) - its window has the green Collect
-        if self.cfg["rotate_accounts"] and time.time() >= self._rotate_pause_until:
-            self._switch_streak = 0  # every account always has more to farm here: never 'all done'
+        self.bb_collect()  # the Elixir Cart (and collectors)
+        self._upgrade_backoff.pop("bb_builder", None)
+        self._upgrade_backoff.pop("bb_lab", None)
+        saving = self.bb_upgrades()
+        # next account only once every builder + the Star Lab here is busy - never while saving up for an upgrade
+        if not saving and self.cfg["rotate_accounts"] and time.time() >= self._rotate_pause_until:
+            self._switch_streak = 0  # there's always more to farm on the Builder Base: never 'all done'
             self.switch_account()
 
     def reload_if_disconnected(self, frame):
