@@ -72,7 +72,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 23  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 24  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1304,6 +1304,7 @@ class Bot:
         self.loot = {}        # account -> [gold, elixir, dark, attacks] farmed this session
         self._names = list(dict.fromkeys((cfg.get("account_tags") or {}).values()))  # misreads snap to these
         self._saving_home = None  # account farming for its next home plan target: no Builder Base trips meanwhile
+        self._bb_saving = None  # resource the Builder Base plan is saving up (the Star Lab leaves it alone)
         self._view = None  # background zoom + pan for the base being scouted
         self._last_name = None
         self._cur = self._pre = None  # (account, (gold, elixir, dark)) now / just before the attack
@@ -1741,14 +1742,14 @@ class Bot:
         return self.read_pair(frame, LOOT_PROMPT, "use_groq_for_loot",
                               ("loot_gold_region", "loot_elixir_region"), True)
 
-    def read_storage(self, frame):
+    def read_storage(self, frame, village="home"):
         g, e = self.read_pair(frame, STORAGE_PROMPT, "use_groq_for_bank",
                               ("bank_gold_region", "bank_elixir_region"), False,
                               cap=99_999_999)  # storages hold far more than any base's loot
         s = {"gold": g, "elixir": e}
         if g is not None or e is not None:
-            self.emit("storage", s)
-        self.log(f"Storage: gold {g if g is None else f'{g:,}'} / elixir {e if e is None else f'{e:,}'}")
+            self.emit("storage", dict(s, village=village))
+        self.log(("Builder Base storage" if village == "builder" else "Storage") + f": gold {g if g is None else f'{g:,}'} / elixir {e if e is None else f'{e:,}'}")
         return s
 
     # --- attacking ---
@@ -2337,9 +2338,12 @@ class Bot:
     def bb_upgrades(self):
         """Keep the Builder Base builders + Star Lab busy: the next target in this account's plan (or wait for it),
         else the most expensive thing affordable. True if any builder / the Star Lab is still free afterwards."""
-        free = False
+        free, self._bb_saving = False, None
         for kind in ("bb_builder", "bb_lab"):
             if not self.cfg["bb_builder_upgrades" if kind == "bb_builder" else "bb_lab_upgrades"]:
+                continue
+            if kind == "bb_lab" and self._bb_saving == "elixir":
+                self.log("Star Lab: waiting - the Builder Base plan is saving Builder Elixir for its next upgrade.")
                 continue
             for _ in range(3):
                 if not self.free_slots(self.shot(), kind):
@@ -2399,8 +2403,10 @@ class Bot:
         bb_farm: builders + Star Lab follow the planner (or upgrade anything, with no plan); attacks for today's
         Star Bonuses, then rounds of 5 attacks + the Elixir Cart, checking the upgrades after each round - it stays
         on the account until its next upgrade is bought, and only moves on (when rotating) once all are busy."""
-        name = self.account_name(self.shot())
+        f = self.shot()
+        name = self.account_name(f)
         self.emit("state", f"Builder Base only ({name})")
+        self.read_storage(f, village="builder")
         self.bb_bonus(name)
         self.bb_collect()
         self.bb_clock_boost()
@@ -2499,12 +2505,19 @@ class Bot:
             self._saving_home = None
         seen = self.read_list()  # the whole list first: the discount and levels are worked out from all of it
         plan, levels = self.plan_positions(kind, seen)
+        other = None  # saving up for the plan's next target: the resource it does NOT need (spare builders use it)
         if plan:  # this account has a plan: stick to it - the next target in order, or wait (keep farming) for it
             i = min(plan.values())
             rows = [(nm, p, ok) for nm, p, ok in seen if plan.get((nm, p)) == i]
             buy = [r for r in rows if r[2]]
-            if not buy:
-                it = self.plan_items(kind)[i]
+            it = self.plan_items(kind)[i]
+            res = wiki_data()[it["key"]]["levels"][0]["res"]
+            other = None
+            if not buy and kind == "bb_builder":
+                self._bb_saving = res  # the Star Lab won't spend it meanwhile
+                if (free_before or 0) >= 2:  # a builder to spare (one stays free for the target): spend the
+                    other = res              # other resource instead of letting it sit at max
+            if not buy and other is None:
                 self._upgrade_backoff[kind] = time.time() + 900
                 if kind == "builder":  # farm home until it's bought - the Builder Base waits, the list stays shut
                     self._saving_home = (self._last_name, min(p for _, p, _ in rows),
@@ -2517,7 +2530,13 @@ class Bot:
         for nm, price, ok in seen:
             skip = is_wall(nm) or (  # walls: the wall routine; TH: optional no-rush
                 self.cfg.get("skip_town_hall", True) and re.search(r"t[o0]wn\s*ha", nm.lower()))
-            if skip or not ok or (plan and plan.get((nm, price)) != min(plan.values())):
+            if skip or not ok:
+                continue
+            if plan and other is not None:  # saving up: only things paid in the other resource
+                k = wiki_key(nm, "builder")
+                if not k or wiki_data()[k]["levels"][0]["res"] == other:
+                    continue
+            elif plan and plan.get((nm, price)) != min(plan.values()):
                 continue
             bb = next((i for i, r in enumerate(BB_DEFAULT_ROWS) if name_match(nm, r["name"])), 99) \
                 if kind == "bb_builder" else 99
@@ -2578,7 +2597,9 @@ class Bot:
                 self.tap(icon, 1.2)
             got, glv = self.selected_label(self.shot())  # is the selected building really the one chosen?
             want = re.sub(r"(?i)\s*x\s*\d+\s*$", "", nm)
-            if got and not name_match(got, want):
+            base = "builder" if kind.startswith("bb_") else "home"
+            gk, wk = wiki_key(got, base) if got else None, wiki_key(want, base)
+            if gk and wk and gk != wk:  # clearly another building; OCR noise in the label doesn't count
                 self._upgrade_backoff[kind] = time.time() + 600
                 self.back_to_village(icon)
                 return self.log(f"{KIND_NAMES[kind]}: the list selected '{got}' (level {glv}), not '{want}' - "
@@ -4787,14 +4808,16 @@ class App(tk.Tk):
         side.columnconfigure(0, weight=1)
         side.rowconfigure(1, weight=1)
         res = self.card(side, "Your storage", row=0, column=0, pady=S(0, 12))
+        self.res_card_title = res.winfo_children()[0]
         grid = tk.Frame(res, bg=CARD)
         grid.pack(fill="x")
-        self.res_labels = {}
+        self.res_labels, self.res_icons = {}, {}
         for i, (key, col, icon) in enumerate([("s_gold", GOLD, "gold"), ("s_elixir", PINK, "elixir")]):
             grid.columnconfigure(i, weight=1, uniform="r")
             cell = tk.Frame(grid, bg=CARD)
             cell.grid(row=0, column=i, sticky="w")
-            tk.Label(cell, image=self.ui_icon(icon, S(32)), bg=CARD).pack(side="left", padx=S(0, 8))
+            self.res_icons[key[2:]] = tk.Label(cell, image=self.ui_icon(icon, S(32)), bg=CARD)
+            self.res_icons[key[2:]].pack(side="left", padx=S(0, 8))
             self.res_labels[key] = tk.Label(cell, text="—", bg=CARD, fg=col, font=(self._font, 16, "bold"))
             self.res_labels[key].pack(side="left")
         lc = self.card(side, "This session", row=1, column=0)
@@ -5012,9 +5035,15 @@ class App(tk.Tk):
                     if self.adb.device in data:
                         self.dev_combo.set(self.adb.device)
                 elif kind == "storage":
+                    bb = data.pop("village", "home") == "builder"
                     for k, v in data.items():
                         if v is not None:
                             self.res_labels["s_" + k].config(text=f"{v:,}")
+                    for k, (icon, title) in {"gold": ("bgold" if bb else "gold", "Builder Gold" if bb else "Gold"),
+                                             "elixir": ("belixir" if bb else "elixir",
+                                                        "Builder Elixir" if bb else "Elixir")}.items():
+                        self.res_icons[k].config(image=self.ui_icon(icon, S(32)))
+                    self.res_card_title.config(text="BUILDER BASE STORAGE" if bb else "YOUR STORAGE")
                 elif kind == "loot":
                     self.loot_rows = data
                     self.render_loot()
