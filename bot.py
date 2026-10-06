@@ -72,7 +72,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 25  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 26  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -113,6 +113,7 @@ BUTTONS = [
     ("bb_return_home", "Builder Base Return Home  - builder base"),
     ("bb_elixir_bubble", "Builder Base elixir bubble  - builder base"),
     ("bb_gold_bubble", "Builder Base gold bubble  - builder base"),
+    ("bb_cart", "The Elixir Cart itself, by the dock  - builder base"),
     ("bb_cart_title", "Elixir Cart window title  - builder base"),
     ("bb_cart_collect", "Elixir Cart green Collect  - builder base"),
     ("bb_bonus_title", "'Star Bonus!' popup title  - builder base"),
@@ -853,7 +854,8 @@ def read_counter(frame, box):
 def troop_bar(frame):
     """Cards on the battle bar, left to right: [(x, y, kind, count)]. Each card is found by its dark
     outline (two tall vertical edges one card-width apart). kind: 'troop' (blue card with a count),
-    'spell' (purple card with a count), 'single' (hero / siege / pet: no count), 'used' (greyed x0),
+    'spell' (purple card with a count), 'hero' (purple card, no count), 'single' (Clan Castle / siege machine:
+    light blue, no count), 'used' (greyed x0),
     'empty' (dashed slot)."""
     glyphs = digit_glyphs()
     if glyphs is None:
@@ -925,8 +927,10 @@ def troop_bar(frame):
             kind = "used"
         elif colored.mean() < 0.2 or not level_badge(a, b):
             kind = "empty"
-        elif cnt is None:
-            kind = "single"
+        elif cnt is None:  # no count: a hero (purple card) or the Clan Castle / siege machine (light blue card)
+            edge = cv2.cvtColor(frame[int(H * 0.85):int(H * 0.95), a + 5:a + 14], cv2.COLOR_BGR2HSV)
+            e = edge[:, :, 0][(edge[:, :, 1] > 90) & (edge[:, :, 2] > 90)]
+            kind = "hero" if len(e) and 112 <= np.median(e) <= 160 else "single"  # CC ~94, heroes ~122-146
         else:
             hh = cv2.cvtColor(frame[top:top + 45, a + 6:a + (b - a) // 3], cv2.COLOR_BGR2HSV)
             hdr = hh[:, :, 0][(hh[:, :, 1] > 90) & (hh[:, :, 2] > 90)]
@@ -2209,8 +2213,11 @@ class Bot:
         # only bubbles in the open middle: one sitting over the edge buttons (Season Pass, Attack, Shop, the
         # resource bars...) would tap that button instead. It gets collected another time.
         safe = lambda p: 0.13 * W < p[0] < 0.87 * W and 0.11 * H < p[1] < 0.76 * H
-        for xy in filter(safe, self.matches(f, "bb_elixir_bubble", 0.7) + self.matches(f, "bb_gold_bubble", 0.7)
-                         + self.matches(f, "bb_gem_bubble", 0.7)):
+        # the Elixir Cart sits up by the dock: its bubble is often off the top edge, so tap the cart itself
+        cart = self.find_any_zoom(f, "bb_cart", 0.75)
+        cart = [cart] if cart and 0.13 * W < cart[0] < 0.76 * W and cart[1] < 0.76 * H else []
+        for xy in cart + list(filter(safe, self.matches(f, "bb_elixir_bubble", 0.7)
+                                     + self.matches(f, "bb_gold_bubble", 0.7) + self.matches(f, "bb_gem_bubble", 0.7))):
             self.tap(xy, 1.0)
             f = self.shot()
             if self.find(f, "bb_cart_title"):
@@ -2270,7 +2277,7 @@ class Bot:
         cards, end = [], time.time() + 40
         while not cards and time.time() < end:  # matchmaking, then the battle screen with the troop bar
             self.sleep(1.5)
-            cards = [c for c in troop_bar(self.shot()) if c[2] in ("single", "troop")]
+            cards = [c for c in troop_bar(self.shot()) if c[2] in ("hero", "single", "troop")]
         if not cards:
             return self.log("Builder Base: no battle screen after Find Now.", "warn")
         self.bump("attacks")
@@ -2286,7 +2293,7 @@ class Bot:
                 return self.wait_for("bb_attack_button", 15)
             # 100% on stage 1 starts stage 2 with extra cards (+ the survivors): drop everything not used up.
             # Tapping an already-deployed card is harmless (the Battle Machine's = its ability).
-            self.bb_deploy([c for c in troop_bar(f) if c[2] in ("single", "troop")])
+            self.bb_deploy([c for c in troop_bar(f) if c[2] in ("hero", "single", "troop")])
         self.log("Builder Base: battle didn't finish in time.", "warn")
 
     def bb_deploy(self, cards):
@@ -2397,6 +2404,22 @@ class Bot:
             self.log(f"Builder Base: stars {st[0]}/{st[1]} - attacking.")
             self.bb_attack()
 
+    def track_bb(self, name, s):
+        """Builder Base loot this session: what the storages gained since the last read on this account (Star
+        Bonuses, the Elixir Cart, collectors). ponytail: an upgrade bought in between hides that read's gain."""
+        now, n = (s.get("gold"), s.get("elixir")), self.stats["attacks"]
+        pre, self._bb_pre = getattr(self, "_bb_pre", None), (name, now, n)
+        if not pre or pre[0] != name or None in now or None in pre[1]:
+            return
+        gain = [max(0, a - b) for a, b in zip(now, pre[1])]
+        if max(gain) > 20_000_000 or not (any(gain) or n > pre[2]):
+            return
+        row = self.loot.setdefault(name, [0, 0, 0, 0])
+        row[0], row[1], row[3] = row[0] + gain[0], row[1] + gain[1], row[3] + n - pre[2]
+        self.emit("loot", {a: list(r) for a, r in self.loot.items()})
+        if any(gain):
+            self.log(f"{name}: +{gain[0]:,} Builder Gold, +{gain[1]:,} Builder Elixir")
+
     def bb_only(self):
         """'Builder Base only' modes: stay on the Builder Base.
         bb_loot: attack non-stop on this account, claiming the Elixir Cart every 10 attacks.
@@ -2406,7 +2429,7 @@ class Bot:
         f = self.shot()
         name = self.account_name(f)
         self.emit("state", f"Builder Base only ({name})")
-        self.read_storage(f, village="builder")
+        self.track_bb(name, self.read_storage(f, village="builder"))
         self.bb_bonus(name)
         self.bb_collect()
         self.bb_clock_boost()
@@ -3234,7 +3257,7 @@ class Bot:
         cards = cards or troop_bar(self.shot())  # the deploy's debug read, when there was one
         troops = [cd for cd in cards if cd[2] == "troop" and cd[3]]
         spells = [cd for cd in cards if cd[2] == "spell" and cd[3]] if self.cfg["deploy_spells"] else []
-        singles = [cd for cd in cards if cd[2] == "single"]
+        singles = [cd for cd in cards if cd[2] in ("hero", "single")]
         if not troops and not singles:
             return False
         fp = self.cfg["fixed_points"]
@@ -3254,7 +3277,9 @@ class Bot:
                 self.tap((x, y), delay)
                 self.adb.tap(*self.along(a, b, k, len(singles)))
             self.sleep(0.1)
-        self._ability_cards = [(x, y) for x, y, _, _ in singles]  # tapping a deployed hero's card = its ability
+        # tapping a deployed hero's card = its ability. Never the Clan Castle's: a siege machine's card would
+        # break it open early
+        self._ability_cards = [(x, y) for x, y, kind, _ in singles if kind == "hero"]
         self.log(f"Auto-deployed {sum(cd[3] for cd in troops)} troops ({len(troops)} types), "
                  f"{len(singles)} heroes/siege" + (f", {len(spells)} spell types." if spells else "."))
         return True
@@ -3458,14 +3483,15 @@ const STATS=[["runtime","Runtime"],["attacks","Attacks","king"],["walls","Walls"
 async function tick(){try{const s=await (await fetch("status"+Q,{cache:"no-store"})).json();
 const st=$("state");st.textContent=s.state;st.className="pill"+(/idle|stopped/i.test(s.state)?" idle":/recover/i.test(s.state)?" off":"");
 $("mode").textContent=s.mode?"Mode: "+s.mode:"";
-const R=s.rates||{};$("rates").innerHTML=[["gold","gold"],["elixir","elixir"],["dark","dark"]].map(([k,c])=>
-`<div class="c"><img src="${ic(k)}"><div style="min-width:0"><div class="v ${c}">${((R[k]||["—"])[0]).replace(" / h","").replace(/(\\.\\d)\\dM/,"$1M")}</div><div class="l">per hour</div><div class="l" style="text-transform:none">${((R[k]||["",""])[1]).replace(" this session"," total")}</div></div></div>`).join("");
+const B=s.bb,I=k=>B&&k!="dark"?"b"+k:k;$("rates").className="row "+(B?"r2":"r3");
+const R=s.rates||{};$("rates").innerHTML=[["gold","gold"],["elixir","elixir"]].concat(B?[]:[["dark","dark"]]).map(([k,c])=>
+`<div class="c"><img src="${ic(I(k))}"><div style="min-width:0"><div class="v ${c}">${((R[k]||["—"])[0]).replace(" / h","").replace(/(\\.\\d)\\dM/,"$1M")}</div><div class="l">per hour</div><div class="l" style="text-transform:none">${((R[k]||["",""])[1]).replace(" this session"," total")}</div></div></div>`).join("");
 $("store").innerHTML=[["s_gold","gold","gold"],["s_elixir","elixir","elixir"]].map(([k,i,c])=>
-`<div class="c"><img src="${ic(i)}"><div class="v ${c}">${s[k]??"—"}</div></div>`).join("");
+`<div class="c"><img src="${ic(I(i))}"><div class="v ${c}">${s[k]??"—"}</div></div>`).join("");
 $("g").innerHTML=STATS.map(([k,l,i])=>`<div class="c s"><div class="l">${i?`<img src="${ic(i)}" style="height:14px;vertical-align:-2px"> `:""}${l}</div><div class="v">${s[k]??"-"}</div></div>`).join("");
 const L=s.loot||[];$("loot").innerHTML=L.length?L.map(r=>`<div class="acc"><b>${r[0]}</b>
-<span class="gold"><img src="${ic("gold")}">${r[1]}</span><span class="elixir"><img src="${ic("elixir")}">${r[3]}</span>
-<span class="dark"><img src="${ic("dark")}">${r[5]}</span><span><img src="${ic("king")}">${r[7]}</span></div>`).join(""):'<div class="sub">Shows up once farming starts.</div>';
+<span class="gold"><img src="${ic(I("gold"))}">${r[1]}</span><span class="elixir"><img src="${ic(I("elixir"))}">${r[3]}</span>
+${B?"":`<span class="dark"><img src="${ic("dark")}">${r[5]}</span>`}<span><img src="${ic("king")}">${r[7]}</span></div>`).join(""):'<div class="sub">Shows up once farming starts.</div>';
 const W=s.walls_view||[];$("walls").innerHTML=W.length?W.map(w=>`<div class="wall"><b>${w[0]}</b><div class="${w[2]?"n":"ok"}">${w[1]}</div>${w[2]?`<div class="m">${w[2]}</div>`:""}</div>`).join(""):'<div class="sub">Scan an account in the planner to see its walls.</div>';
 $("log").textContent=(s.log||[]).join("\\n");
 $("f").src="frame.jpg"+Q+"&t="+Date.now();}catch(e){const st=$("state");st.textContent="PC not reachable";st.className="pill off";}}
@@ -3951,7 +3977,7 @@ SIDE, NAV_ON = "#141414", "#262b33"  # sidebar, selected page
 # what the mode picker shows: mode -> (title, one line, icon in wiki/ui)
 MODES = {"farm": ("Full farm", "Attacks, upgrades, walls", "king"), "loot": ("Loot only", "Just attack", "gold"),
          "walls": ("Walls only", "Farm + buy walls", "wall"),
-         "bb_loot": ("BB loot", "Builder Base: attack non-stop", "bgold"),
+         "bb_loot": ("BB loot", "Builder Base attacks", "bgold"),
          "bb_farm": ("BB farm", "Builder Base + upgrades", "builderhall")}
 GREEN, AMBER, RED, BLUE, GOLD, PINK = "#4cc38a", "#e5b454", "#ff6b6b", "#57a6ff", "#f5c542", "#d77bff"
 LEVEL_COLORS = {"info": TEXT, "ok": GREEN, "warn": AMBER, "err": RED}
@@ -4823,13 +4849,14 @@ class App(tk.Tk):
         lc = self.card(side, "This session", row=1, column=0)
         rates = tk.Frame(lc, bg=CARD)
         rates.pack(fill="x")
-        self.rate_labels = {}
+        self.rate_labels, self.rate_icons, self.rate_cells, self.bb_view = {}, {}, {}, False
         for i, (key, col, icon) in enumerate([("gold", GOLD, "gold"), ("elixir", PINK, "elixir"),
                                               ("dark", "#b9a3ff", "dark")]):
             rates.columnconfigure(i, weight=1, uniform="rt")
-            cell = tk.Frame(rates, bg="#232323", padx=S(10), pady=S(8))
+            cell = self.rate_cells[key] = tk.Frame(rates, bg="#232323", padx=S(10), pady=S(8))
             cell.grid(row=0, column=i, sticky="nsew", padx=S(0 if i == 0 else 6, 0))
-            tk.Label(cell, image=self.ui_icon(icon, S(30)), bg="#232323").pack(side="left", padx=S(0, 8))
+            self.rate_icons[key] = tk.Label(cell, image=self.ui_icon(icon, S(30)), bg="#232323")
+            self.rate_icons[key].pack(side="left", padx=S(0, 8))
             t = tk.Frame(cell, bg="#232323")
             t.pack(side="left")
             per = tk.Label(t, text="—", bg="#232323", fg=col, font=(self._font, 15, "bold"))
@@ -5035,15 +5062,10 @@ class App(tk.Tk):
                     if self.adb.device in data:
                         self.dev_combo.set(self.adb.device)
                 elif kind == "storage":
-                    bb = data.pop("village", "home") == "builder"
+                    self.set_bb_view(data.pop("village", "home") == "builder")
                     for k, v in data.items():
                         if v is not None:
                             self.res_labels["s_" + k].config(text=f"{v:,}")
-                    for k, (icon, title) in {"gold": ("bgold" if bb else "gold", "Builder Gold" if bb else "Gold"),
-                                             "elixir": ("belixir" if bb else "elixir",
-                                                        "Builder Elixir" if bb else "Elixir")}.items():
-                        self.res_icons[k].config(image=self.ui_icon(icon, S(32)))
-                    self.res_card_title.config(text="BUILDER BASE STORAGE" if bb else "YOUR STORAGE")
                 elif kind == "loot":
                     self.loot_rows = data
                     self.render_loot()
@@ -5083,6 +5105,7 @@ class App(tk.Tk):
             st["loot"] = getattr(self, "loot_view", [])
             st["rates"] = {k: [a.cget("text"), b.cget("text")] for k, (a, b) in self.rate_labels.items()}
             st["walls_view"] = getattr(self, "walls_view", [])
+            st["bb"] = self.bb_view
             st["mode"] = MODES[self.bot.mode if self.bot else self.mode_var.get()][0]
             st.update(state=self.state_label.cget("text"), log=list(self.recent))
             self.phone.status = st
@@ -5225,6 +5248,24 @@ class App(tk.Tk):
             if k != mode:
                 card.config(highlightbackground=CARD)
 
+    def res_icon(self, k):
+        """'gold' -> 'bgold' etc. while the bot is on the Builder Base."""
+        return {"gold": "bgold", "elixir": "belixir"}.get(k, k) if self.bb_view else k
+
+    def set_bb_view(self, bb):
+        """Builder Base: Builder Gold / Builder Elixir icons everywhere, no Dark Elixir. Home: the normal ones."""
+        if bb == self.bb_view:
+            return
+        self.bb_view = bb
+        for k, lbl in self.res_icons.items():
+            lbl.config(image=self.ui_icon(self.res_icon(k), S(32)))
+        self.res_card_title.config(text="BUILDER BASE STORAGE" if bb else "YOUR STORAGE")
+        for k, lbl in self.rate_icons.items():
+            lbl.config(image=self.ui_icon(self.res_icon(k), S(30)))
+        self.rate_cells["dark"].master.columnconfigure(2, weight=0 if bb else 1, uniform="" if bb else "rt")
+        self.rate_cells["dark"].grid_remove() if bb else self.rate_cells["dark"].grid()
+        self.render_loot()
+
     def render_loot(self):
         """Per-account session loot + per-hour rates (loot / time since Start), with an all-accounts total."""
         rows = getattr(self, "loot_rows", {})
@@ -5252,7 +5293,9 @@ class App(tk.Tk):
             tk.Label(row, text=acc, bg=CARD, fg=TEXT, font=("Segoe UI", 10, "bold"), width=12, anchor="w").pack(
                 side="left")
             for v, icon, col in ((g, "gold", GOLD), (e, "elixir", PINK), (dk, "dark", "#b9a3ff"), (n, "king", TEXT)):
-                tk.Label(row, image=self.ui_icon(icon, S(18)), bg=CARD).pack(side="left", padx=S(10, 3))
+                if icon == "dark" and self.bb_view:
+                    continue
+                tk.Label(row, image=self.ui_icon(self.res_icon(icon), S(18)), bg=CARD).pack(side="left", padx=S(10, 3))
                 tk.Label(row, text=str(v) if icon == "king" else short(v), bg=CARD, fg=col,
                          font=("Segoe UI", 10, "bold")).pack(side="left")
         if hrs and hrs >= 0.05 and rows:  # from the first attack (~3 min): rough, sharpens as the session goes

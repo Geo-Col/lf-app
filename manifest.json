@@ -1,7 +1,7 @@
 {
- "version": 25,
+ "version": 26,
  "files": {
-  "bot.py": "2fb513167e3f3252a2f39ab5ea6308e70b476f33fb36ff62dd6b0d16d741dcd3",
+  "bot.py": "23eb62947738b749a8f96bfa9f94f7424dea9376442180ca0958adc1035b3e48",
   "setup.ps1": "2ef2b8485cb8aecc277dafc238afa8002093f611728e017e8124fd53c7faf25f",
   "Setup.bat": "3d3ea502d691eccb7207f2d7388826a07c48f3f0c8eafa6c0a96df51b88bb8d3",
   "README.txt": "5e5ebd4c2582976e28beff33666188f259029bee093000218d54e42cc34a6984",
@@ -14,6 +14,7 @@
   "templates/bb_bonus_title.png": "5587cc11152f6e0fa8009dcaabb23700d69d65a7492ce9cd7ac71cd82dc95551",
   "templates/bb_boost_button.png": "57b7ed2f4ca810aee7976f4e6a9cfc87c0a54f40fc39cecf0ca54306ab5864db",
   "templates/bb_boost_title.png": "3e870ce64426a06b278bc9f87c5141e137da3f94e5e59b3a9809a0e70284771a",
+  "templates/bb_cart.png": "d12c5afd723fda446ec6d95e079864195cb67dea25788b34f913704a80a217f9",
   "templates/bb_cart_collect.png": "408bff072d4fcd5c2115fc903999de48436fedcf614e43223eca5fcf178d79be",
   "templates/bb_cart_title.png": "57747e9ac6374e308d692a31ceca6e53cfeec2732fe27e846af100530cef87e7",
   "templates/bb_clock_bubble.png": "a20b8aab25b772eb87fab8de96f3404025b152b17780e05d885cc7a87af30381",
