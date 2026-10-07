@@ -72,7 +72,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 28  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 29  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1383,6 +1383,9 @@ class Bot:
         self.log("Farming started.", "ok")
         self.emit("stats", dict(self.stats))
         prev, unknown_since, backs, adb_fails, online = "START", None, 0, 0, None
+        awake = lambda on: os.name == "nt" and ctypes.windll.kernel32.SetThreadExecutionState(
+            0x80000000 | (0x1 if on else 0))  # ES_CONTINUOUS | ES_SYSTEM_REQUIRED: no sleeping while farming
+        awake(True)
         try:
             while True:
                 try:
@@ -1451,6 +1454,8 @@ class Bot:
                     self.sleep(3)
         except Abort:
             pass
+        finally:
+            awake(False)
         self.log("Farming stopped.", "ok")
         self.emit("state", "Stopped")
 
@@ -1520,9 +1525,20 @@ class Bot:
         self._pre = self._cur  # storage right before this attack
         self.tap(self.hits["attack_button"])
 
+    def ambiguous(self):
+        """True while the top-left name is one that two accounts share ('GeoCol2' and 'GeoCol2 (GeoCol2)') and
+        nothing yet says which of them this is - e.g. after switching accounts by hand."""
+        n = self._last_name
+        return bool(n) and " (" not in n and n != getattr(self, "_tag_ok", None) and any(k.startswith(n + " (") for k in self.cfg.get("scans") or {})
+
     def on_home(self, frame, prev):
         self.game_relaunches = 0
         self._view = None
+        self.account_name(frame)
+        if self.ambiguous() and self.mode != "loot" and time.time() >= getattr(self, "_amb_try", 0):
+            self._amb_try = time.time() + 600  # the export's player tag says which one (then account_name knows)
+            if self.scan_export():
+                return
         storage = self.track_loot(frame, self.read_storage(frame))
         if self.mode == "loot":  # Loot only: no upgrades, walls or account switching - just attack
             return self.attack_now()
@@ -1903,6 +1919,8 @@ class Bot:
     def wall_price(self):
         """Cost of the next wall upgrade (the lowest wall that isn't max), 0 if every wall is max, None if this
         account's walls haven't been scanned."""
+        if self.ambiguous():
+            return None  # not sure whose walls these are
         sd = ((self.cfg.get("scans") or {}).get(self._last_name) or {}).get("home") or {}
         counts, mx, todo, _ = walls_left(sd)
         if not counts or not mx:
@@ -2032,6 +2050,19 @@ class Bot:
                 rows = again
                 break
             rows = again or rows
+        # one 'Wall xN' row per level, not in price order ('Wall x112 1,500,000' above 'Wall x184 1,000,000'):
+        # take the cheapest affordable one. A row at the bottom edge may have another just under it - nudge up.
+        box = panel_box(self.shot())
+        if box and max(y for _, y in rows) > box[3] - 90:
+            cx = (box[0] + box[1]) // 2
+            self.adb.swipe(cx, box[3] - 60, cx, box[3] - 260, 700)
+            self.sleep(1.2)
+            rows = self.find_wall_rows(self.shot()) or rows
+        f = self.shot()
+        box = panel_box(f)
+        if box and len(rows) > 1:  # unaffordable prices are red, read as None: those go last
+            rows = sorted(rows, key=lambda r: white_number(f, (box[1] - 200, r[1] - 20, box[1] - 10, r[1] + 20))
+                          or 10 ** 12)
         self.tap(rows[0], 1.2)
         f = self.shot()
         if panel_box(f):  # the list sometimes stays open over the buttons: its icon closes it
@@ -2756,8 +2787,8 @@ class Bot:
             hall = max(reqs) if reqs else None
         hero = next((r["level"] for r in items if r["key"] == "home:hero hall" and r["level"] is not None), None)
         acc = self._last_name
-        if not acc or acc == "?":  # never file a scan under an unknown account - it'd mix accounts up
-            self.log("Upgrade planner: couldn't read the account name - scan not saved.", "warn")
+        if not acc or acc == "?" or self.ambiguous():  # never file a scan under an unknown account - it'd mix
+            self.log("Upgrade planner: not sure which account this is - scan not saved.", "warn")  # them up
             return {"items": items, "discount": f, "hall": hall}
         scans = self.cfg.setdefault("scans", {}).setdefault(acc, {})
         old = scans.get(base) or {}
@@ -2896,7 +2927,7 @@ class Bot:
                 self._settings_name = next((x for x in self._names if near and x.lower() == near[0]), n)
                 break
             self.sleep(0.5)
-        data = None
+        data, hit = None, None
         if more:
             self.tap(more, 0.8)
             for _ in range(8):  # touch nothing until the More Settings window has finished opening
@@ -2926,6 +2957,10 @@ class Bot:
                     except (ValueError, AttributeError):
                         pass
                     self.sleep(1.0)
+        if not data:  # which step: for the debug report
+            cv2.imwrite(os.path.join(BASE_DIR, "debug_export.png"), self.shot())
+            log_file.info("export failed: " + ("no More Settings button" if not more else "no Copy row found"
+                                               if not hit else "clipboard had no fresh export"))
         self.back_to_village()
         return data
 
@@ -2942,9 +2977,20 @@ class Bot:
         # never fails just because a name couldn't be read (a fancy name / font / layout on another PC)
         acc = (tags.get(data["tag"]) or (self._last_name if self._last_name not in (None, "?") else None)
                or getattr(self, "_settings_name", None) or data["tag"])
+        bases = export_items(data)
+        if data["tag"] not in tags and acc in tags.values():
+            # a new tag under a name another account already has (two accounts called 'GeoCol2'): never file it
+            # over that one - its own 'name (...)' entry with this Town Hall, else a new one keyed by the tag
+            hall = next((r["level"] - r["upgrading"] for r in bases.get("home") or [] if r["key"] == "home:town hall"),
+                        None)
+            acc = next((k for k, s in (self.cfg.get("scans") or {}).items() if k.startswith(acc + " (")
+                        and k not in tags.values() and ((s or {}).get("home") or {}).get("hall") == hall),
+                       f"{acc} ({data['tag']})")
+        self._sc_key = acc if " (" in acc else None  # what account_name() reports for a shared in-game name
+        self._tag_ok = acc  # the export's tag settled which account this is
         tags[data["tag"]] = self._last_name = acc
         scans = self.cfg.setdefault("scans", {}).setdefault(acc, {})
-        for base, items in export_items(data).items():
+        for base, items in bases.items():
             if not items:
                 continue
             hall = next((r["level"] - r["upgrading"] for r in items
@@ -3195,7 +3241,7 @@ class Bot:
         row = rows[self._acc_idx]
         name = row["sc"]
         self.log(f"Switching account -> {name}", "ok")
-        self._last_name, self._pre, self._sc_key = None, None, None  # new account: re-read its name
+        self._last_name, self._pre, self._sc_key, self._tag_ok = None, None, None, None  # new account: re-read its name
         if not self.tap_account(name):
             return self.switch_fail(f"couldn't find {name} on the Supercell ID list")
         self._cur_sc = name
@@ -5524,7 +5570,7 @@ class App(tk.Tk):
                     files.append(("cloudflared.log", "".join(f.readlines()[-80:]).encode()))
             except OSError:
                 pass
-            for name in ("debug_deploy.png", "debug_wall.png", "debug_boat.png"):
+            for name in ("debug_deploy.png", "debug_wall.png", "debug_boat.png", "debug_export.png"):
                 path = os.path.join(BASE_DIR, name)
                 if os.path.exists(path) and time.time() - os.path.getmtime(path) < 6 * 3600:
                     img = cv2.imread(path)
