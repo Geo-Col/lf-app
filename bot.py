@@ -72,7 +72,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 26  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 27  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -925,7 +925,8 @@ def troop_bar(frame):
             cnt = number(top - int(H * 0.017), top + 35, a + (b - a) // 3, b - 4, 18)
         if grey.mean() > 0.4:
             kind = "used"
-        elif colored.mean() < 0.2 or not level_badge(a, b):
+        elif cnt is None and (colored.mean() < 0.2 or not level_badge(a, b)):  # a count = a real card (event
+            # troops have a grey card + an orange level badge)
             kind = "empty"
         elif cnt is None:  # no count: a hero (purple card) or the Clan Castle / siege machine (light blue card)
             edge = cv2.cvtColor(frame[int(H * 0.85):int(H * 0.95), a + 5:a + 14], cv2.COLOR_BGR2HSV)
@@ -2290,7 +2291,13 @@ class Bot:
             done = self.find(f, "bb_return_home")
             if done:
                 self.tap(done, 3.0)
-                return self.wait_for("bb_attack_button", 15)
+                if not self.wait_for("bb_attack_button", 15):
+                    return None
+                if self.mode.startswith("bb_"):  # the session's Builder Base loot / hour: storage after every battle
+                    self.sleep(1.5)
+                    f = self.shot()
+                    self.track_bb(self.account_name(f), self.read_storage(f, village="builder"))
+                return True
             # 100% on stage 1 starts stage 2 with extra cards (+ the survivors): drop everything not used up.
             # Tapping an already-deployed card is harmless (the Battle Machine's = its ability).
             self.bb_deploy([c for c in troop_bar(f) if c[2] in ("hero", "single", "troop")])
@@ -2405,14 +2412,25 @@ class Bot:
             self.bb_attack()
 
     def track_bb(self, name, s):
-        """Builder Base loot this session: what the storages gained since the last read on this account (Star
-        Bonuses, the Elixir Cart, collectors). ponytail: an upgrade bought in between hides that read's gain."""
-        now, n = (s.get("gold"), s.get("elixir")), self.stats["attacks"]
-        pre, self._bb_pre = getattr(self, "_bb_pre", None), (name, now, n)
-        if not pre or pre[0] != name or None in now or None in pre[1]:
+        """Builder Base loot this session: what the storages gained since the last read on this account (battles,
+        Star Bonuses, the Elixir Cart, collectors) - read after every battle. ponytail: an upgrade bought in
+        between hides that stretch's gain."""
+        now, n, ups = (s.get("gold"), s.get("elixir")), self.stats["attacks"], self.stats["upgrades"]
+        pre = getattr(self, "_bb_pre", None)
+        if None in now or "?" in name:
+            return  # unreadable: keep the last good read as the baseline
+        if not pre or pre[0] != name:
+            self._bb_pre = (name, now, n, ups)
             return
+        # a drop with nothing bought = a misread (e.g. a lost digit): keep the old baseline, or the read after it
+        # would count the 'recovery' as loot
+        drop = ups == pre[3] and any(a < b * 0.9 for a, b in zip(now, pre[1]))
+        self._bb_drops = getattr(self, "_bb_drops", 0) + 1 if drop else 0
+        if drop and self._bb_drops < 2:  # twice in a row: it's real (spent by hand) - take it as the new baseline
+            return
+        self._bb_pre = (name, now, n, ups)
         gain = [max(0, a - b) for a, b in zip(now, pre[1])]
-        if max(gain) > 20_000_000 or not (any(gain) or n > pre[2]):
+        if max(gain) > 5_000_000 or not (any(gain) or n > pre[2]):  # more in one go = a misread
             return
         row = self.loot.setdefault(name, [0, 0, 0, 0])
         row[0], row[1], row[3] = row[0] + gain[0], row[1] + gain[1], row[3] + n - pre[2]
