@@ -36,6 +36,7 @@ import base64
 import collections
 import ctypes
 import difflib
+import glob
 import hashlib
 import http.server
 import json
@@ -72,7 +73,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 29  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 30  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2230,6 +2231,11 @@ class Bot:
                 if to == "home":
                     self.bb_collect()
                     boat = self.find_any_zoom(self.shot(), "bb_boat") or boat
+                if boat[1] < 200 or boat[0] > 1500:  # under the resource bars: a tap there opens the bar's
+                    # tooltip (which then hides the boat) - drag the map to bring the boat toward the middle
+                    self.adb.swipe(960, 540, 960 + (960 - boat[0]) // 2, 540 + (540 - boat[1]) // 2, 600)
+                    self.sleep(1.0)
+                    boat = self.find_any_zoom(self.shot(), "bb_boat") or boat
                 self.tap(boat, 2.0)
                 if self.wait_for(want, 25, poll=1.0):
                     self.sleep(1.0)
@@ -2602,8 +2608,11 @@ class Bot:
         for nm, price, ok in seen:
             skip = is_wall(nm) or (  # walls: the wall routine; TH: optional no-rush
                 self.cfg.get("skip_town_hall", True) and re.search(r"t[o0]wn\s*ha", nm.lower()))
-            if skip or not ok:
-                continue
+            if skip or not ok or levels.get((nm, price)) == 0 or nm.lower().startswith("new "):
+                continue  # 'New ...' rows build a new one: that's placing it from the shop, not an upgrade
+            if kind.endswith("builder") and wiki_key(nm, "builder" if kind.startswith("bb_") else "home") is None \
+                    and norm_name(nm) not in NO_WIKI:
+                continue  # event Crafting Station defenses (Hot Candle, Cake-A-Pult...): a 3-way stat window
             if plan and other is not None:  # saving up: only things paid in the other resource
                 k = wiki_key(nm, "builder")
                 if not k or wiki_data()[k]["levels"][0]["res"] == other:
@@ -2612,7 +2621,7 @@ class Bot:
                 continue
             bb = next((i for i, r in enumerate(BB_DEFAULT_ROWS) if name_match(nm, r["name"])), 99) \
                 if kind == "bb_builder" else 99
-            rank = (plan.get((nm, price), 10 ** 6), bb, -price)  # 1) your plan 2) 6th builder first 3) priciest
+            rank = (plan.get((nm, price), 10 ** 6), bb, -price)  # 1) your plan 2) key BB buildings 3) priciest
             if not best or rank < best[3]:
                 best = (nm, price, 0, rank)
         if not best:
@@ -2625,7 +2634,7 @@ class Bot:
         self.log(f"{KIND_NAMES[kind]}: choosing '{nm}'" + (f" (level {lv} -> {lv + 1})" if lv is not None else "")
                  + f" for {price:,} - "
                  + (f"#{best[3][0] + 1} in your upgrade plan." if best[3][0] < 10 ** 6
-                    else "Builder Base: Builder Hall / 6th builder (O.T.T.O's Outpost) first." if r[0] < 99
+                    else "a key Builder Base building first (hall, heroes, barracks, labs, clock)." if r[0] < 99
                     else "the most expensive one you can afford."))
         self._started = (kind, nm, price, lv)
         self.tap(icon, 1.0)  # close + reopen = back at the top, then page down until it's on screen
@@ -2684,8 +2693,10 @@ class Bot:
                 hit, shown = self.resource_confirm(kind)  # the GREEN resource Confirm only
         if not hit:
             self._upgrade_backoff[kind] = time.time() + 600
+            cv2.imwrite(os.path.join(BASE_DIR, "debug_upgrade.png"), self.shot())
             self.back_to_village(icon)
-            return self.log(f"{KIND_NAMES[kind]}: no green Confirm for '{nm}' - backed out.", "warn")
+            return self.log(f"{KIND_NAMES[kind]}: no green Confirm for '{nm}' - backed out "
+                            "(screen: debug_upgrade.png).", "warn")
         if shown != price:
             self._upgrade_backoff[kind] = time.time() + 600
             self.back_to_village(icon)
@@ -5570,7 +5581,7 @@ class App(tk.Tk):
                     files.append(("cloudflared.log", "".join(f.readlines()[-80:]).encode()))
             except OSError:
                 pass
-            for name in ("debug_deploy.png", "debug_wall.png", "debug_boat.png", "debug_export.png"):
+            for name in ("debug_deploy.png", "debug_wall.png", "debug_boat.png", "debug_export.png", "debug_upgrade.png"):
                 path = os.path.join(BASE_DIR, name)
                 if os.path.exists(path) and time.time() - os.path.getmtime(path) < 6 * 3600:
                     img = cv2.imread(path)
@@ -5926,6 +5937,25 @@ def selftest():
     print("selftest ok")
 
 
+PACKAGES = ("opencv-python", "Pillow", "numpy", "sv-ttk", "pytesseract", "groq")
+
+
+def bundle_python():
+    """A portable copy of this PC's Python (a normal Windows install runs from any folder) with only the bot's
+    modules in it, built in the temp folder. Returns its path."""
+    out = os.path.join(tempfile.gettempdir(), "lootfarmer_python")
+    shutil.rmtree(out, ignore_errors=True)
+    skip = {"site-packages", "test", "idlelib", "__pycache__", "Doc", "Scripts", "include", "libs", "Tools",
+            "ensurepip", "lib2to3", "tkinter/test", "turtledemo"}
+    shutil.copytree(sys.base_prefix, out, ignore=lambda d, names: [n for n in names if n in skip])
+    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-warn-script-location", "--target",
+                    os.path.join(out, "Lib", "site-packages"), "opencv-python-headless",  # no GUI/video: smaller
+                    *(p for p in PACKAGES if p != "opencv-python")], check=True)
+    for f in glob.glob(os.path.join(out, "Lib", "site-packages", "cv2", "opencv_videoio_ffmpeg*.dll")):
+        os.remove(f)  # video decoding: never used (30 MB)
+    return out
+
+
 def make_package():
     """LootFarmer_share.zip for a friend: bot + templates + setup, with a config stripped of anything personal
     (API key, phone-link secret, device, paths, account names). Setup.bat fills the paths in on their PC."""
@@ -5943,6 +5973,11 @@ def make_package():
                 for f in files:
                     full = os.path.join(root, f)
                     z.write(full, "LootFarmer/" + os.path.relpath(full, BASE_DIR).replace(os.sep, "/"))
+        py = bundle_python()  # Python + the bot's modules inside the folder: no install, no pip on their PC
+        for root, _, files in os.walk(py):
+            for f in files:
+                full = os.path.join(root, f)
+                z.write(full, "LootFarmer/python/" + os.path.relpath(full, py).replace(os.sep, "/"))
         for f in sorted(os.listdir(TEMPLATE_DIR)):
             if f.endswith(".png") and not f.startswith("old_"):
                 z.write(os.path.join(TEMPLATE_DIR, f), f"LootFarmer/templates/{f}")

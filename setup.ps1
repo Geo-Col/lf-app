@@ -37,7 +37,8 @@ if ($Check) { Write-Host "(check mode: nothing will be changed)" -ForegroundColo
 # ---------------------------------------------------------------- 1. Python
 Step "Python"
 function FindPython {
-    foreach ($c in @("$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
+    foreach ($c in @("$Here\python\python.exe",   # the copy that comes in the zip: nothing to install
+"$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
                      "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
                      "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
                      "C:\Program Files\Python312\python.exe", "C:\Program Files\Python311\python.exe")) {
@@ -54,6 +55,19 @@ else {
     Todo "installing Python 3.12 (for this user)..."
     Winget "Python.Python.3.12" @("--scope", "user")
     $Py = FindPython
+    if (-not $Py) {
+        # No winget (older / trimmed Windows): the official installer from python.org, silent, just for this user
+        $exe = "$env:TEMP\python-3.12.10-amd64.exe"
+        Download "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe" $exe
+        $sig = Get-AuthenticodeSignature $exe
+        if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notlike "*Python Software Foundation*") {
+            Remove-Item $exe; Bad "the Python download failed its signature check - not running it."; Read-Host "Press Enter to exit"; exit 1
+        }
+        Todo "running the Python installer (about a minute)..."
+        Start-Process -FilePath $exe -ArgumentList "/quiet InstallAllUsers=0 PrependPath=1 Include_launcher=0 Include_test=0" -Wait
+        Remove-Item $exe -ErrorAction SilentlyContinue
+        $Py = FindPython
+    }
     if (-not $Py) { Bad "Python didn't install. Install it from python.org, then run Setup again."; Read-Host "Press Enter to exit"; exit 1 }
     Ok "installed $Py"
 }
@@ -61,7 +75,13 @@ $PyW = if ($Py) { Join-Path (Split-Path $Py) "pythonw.exe" } else { $null }
 
 # ---------------------------------------------------------------- 2. Python packages
 Step "Python packages"
-if ($Py -and -not $Check) {
+if ($Py -like "$Here\python\*") {
+    if (-not $Check) {
+        & $Py -c "import cv2, numpy, PIL, sv_ttk, pytesseract, tkinter"
+        if ($LASTEXITCODE -ne 0) { Bad "the bundled Python is incomplete - download the zip again." } else { Ok "included in the bot folder" }
+    } else { Ok "included in the bot folder" }
+}
+elseif ($Py -and -not $Check) {
     & $Py -m pip install --upgrade --quiet pip
     & $Py -m pip install --quiet opencv-python Pillow numpy sv-ttk pytesseract groq
     if ($LASTEXITCODE -ne 0) { Bad "pip install failed - check the internet connection and run Setup again." } else { Ok "installed" }

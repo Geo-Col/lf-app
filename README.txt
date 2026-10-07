@@ -29,7 +29,8 @@ Double-click  Setup.bat  in the folder.
   - Answer its questions with y (yes) or n (no).
 
 It installs everything the bot needs and sets BlueStacks up for it:
-  - Python + the bot's packages
+  - Python + the bot's packages (already included in the folder's 'python' folder -
+    nothing to install)
   (Tesseract OCR and ADB / platform-tools are already included in the folder - nothing to install)
   - cloudflared (the phone link that works away from home)
   - BlueStacks: turns ON Android Debug Bridge (ADB), sets resolution to
