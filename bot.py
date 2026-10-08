@@ -73,7 +73,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 34  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 35  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -920,6 +920,9 @@ def troop_bar(frame):
         cnt = number(top, top + 50, a + (b - a) // 3, b - 4, 18)  # 'x16' at the top-right, after the 'x'
         if cnt is None:  # a selected card sits ~15px higher
             cnt = number(top - int(H * 0.017), top + 35, a + (b - a) // 3, b - 4, 18)
+        if cnt is None:  # busy card art (Lightning's bolts) can put an 'edge' inside the card, cutting the count
+            cnt = number(top, top + 50, a + (b - a) // 3, min(W, b + int(W * 0.007)), 18)  # off: a spell without a
+            # count would pass for a hero (tapped once as an 'ability' instead of cast)
         if grey.mean() > 0.4:
             kind = "used"
         elif cnt is None and (colored.mean() < 0.2 or not level_badge(a, b)):  # a count = a real card (event
@@ -1614,13 +1617,14 @@ class Bot:
         self.tap(self.hits["return_home_button"], self.cfg["return_home_delay"])
 
     def on_battle(self, frame, prev):
+        # A fresh base shows 'End Battle' a moment before 'Next' appears: give it a few seconds to be scouting -
+        # also with only heroes on the bar (troops/spells still training), which used to pass for a running battle
+        nxt = self.wait_for("next_button", 3, poll=0.5)
+        if nxt:
+            self.hits["next_button"] = nxt
+            return self.on_scout(self.shot(), "BATTLE")
         left = [c for c in troop_bar(frame) if c[3] and (c[2] == "troop" or c[2] == "spell" and self.cfg["deploy_spells"])]
         if left:
-            # A fresh base shows 'End Battle' a moment before 'Next' appears: give it a few seconds to be scouting.
-            nxt = self.wait_for("next_button", 3, poll=0.5)
-            if nxt:
-                self.hits["next_button"] = nxt
-                return self.on_scout(self.shot(), "BATTLE")
             # the scouting timer ran out before we deployed: the battle started with our army unused
             self.log(f"Battle running with {len(left)} unused troop/spell cards - deploying now.", "warn")
             return self.attack(None, None)
