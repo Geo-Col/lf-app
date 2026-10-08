@@ -43,10 +43,12 @@ import json
 import logging
 import logging.handlers
 import os
+import platform
 import queue
 import re
 import secrets
 import shutil
+import socket
 import struct
 import tempfile
 import threading
@@ -73,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 38  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 39  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -6047,7 +6049,30 @@ def make_package():
     print(f"Created {out}")
 
 
-PUBLISHED = ("bot.py", "setup.ps1", "Setup.bat", "README.txt", ".gitignore", ".gitattributes")
+PUBLISHED = ("bot.py", "setup.ps1", "Setup.bat", "README.txt", ".gitignore", ".gitattributes", "blocked.txt")
+BLOCKED_PCS = ("elliots-macbook-air",)  # PCs not allowed to run Loot Farmer (also blocked.txt, here and on GitHub)
+
+
+def pc_names():
+    """This PC's names, normalised ('Elliots-MacBook-Air.local' -> 'elliots-macbook-air')."""
+    names = {os.environ.get("COMPUTERNAME", ""), socket.gethostname(), platform.node()}
+    return {re.sub(r"[\s_]+", "-", n.strip().lower()).removesuffix(".local") for n in names if n}
+
+
+def pc_blocked():
+    """True if this PC is on the blocklist: the built-in one, blocked.txt in the folder, or blocked.txt on GitHub
+    (so a name can be added without a new version)."""
+    lines = list(BLOCKED_PCS)
+    try:
+        lines += open(os.path.join(BASE_DIR, "blocked.txt"), encoding="utf-8").read().splitlines()
+    except OSError:
+        pass
+    try:
+        lines += fetch("blocked.txt", timeout=6).decode("utf-8", "replace").splitlines()
+    except Exception:
+        pass
+    blocked = {re.sub(r"[\s_]+", "-", ln.split("#")[0].strip().lower()).removesuffix(".local") for ln in lines}
+    return bool(pc_names() & (blocked - {""}))
 
 
 def published_files():
@@ -6196,6 +6221,11 @@ if __name__ == "__main__":
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
         except Exception:
             pass
+        if pc_blocked():
+            log_file.warning(f"Blocked PC {sorted(pc_names())} - not starting.")
+            tk.Tk().withdraw()
+            messagebox.showerror("Loot Farmer", "Loot Farmer isn't available on this PC.")
+            sys.exit()
         _instance = single_instance()
         if _instance is None:
             tk.Tk().withdraw()

@@ -1,0 +1,2 @@
+# PCs that may not run Loot Farmer - one name per line (as shown in the Discord posts). Publish to apply.
+elliots-MacBook-Air
