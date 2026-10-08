@@ -73,7 +73,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 32  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 33  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -97,8 +97,6 @@ BUTTONS = [
     ("upgrade_more_button", "Upgrade More (wall selected)  - walls"),
     ("upgrade_more_disabled", "Upgrade More greyed out (only wall of its level)  - walls"),
     ("wall_upgrade_hammers", "Upgrade More bar: double-hammer icon  - walls"),
-    ("wall_gold_upgrade_button", "Upgrade More bar: gold Upgrade  - walls"),
-    ("wall_elixir_upgrade_button", "Upgrade More bar: elixir Upgrade  - walls"),
     ("wall_okay_button", "Upgrade Walls dialog: Okay  - walls"),
     ("confirm_wall_upgrade_button", "Upgrade window: green Confirm  - upgrades"),
     ("building_upgrade_button", "Selected building's Upgrade button  - upgrades"),
@@ -114,7 +112,6 @@ BUTTONS = [
     ("bb_return_home", "Builder Base Return Home  - builder base"),
     ("bb_elixir_bubble", "Builder Base elixir bubble  - builder base"),
     ("bb_gold_bubble", "Builder Base gold bubble  - builder base"),
-    ("bb_cart", "The Elixir Cart itself, by the dock  - builder base"),
     ("bb_cart_title", "Elixir Cart window title  - builder base"),
     ("bb_cart_collect", "Elixir Cart green Collect  - builder base"),
     ("bb_bonus_title", "'Star Bonus!' popup title  - builder base"),
@@ -541,9 +538,6 @@ class ADB:
 
     def tap(self, x, y):
         self.shell(f"input tap {int(x)} {int(y)}")
-
-    def taps(self, x, y, n):
-        self.shell("; ".join([f"input tap {int(x)} {int(y)}"] * n), timeout=10 + n)
 
     def swipe(self, x1, y1, x2, y2, ms):
         self.shell(f"input swipe {int(x1)} {int(y1)} {int(x2)} {int(y2)} {int(ms)}", timeout=10 + ms / 1000)
@@ -976,7 +970,7 @@ UPGRADE_CATEGORIES = {
                   "dark elixir storage", "gem mine"],
     "town hall": ["town hall", "builder hall"],
 }
-# Builder Base: without a list of your own, go for the Builder Hall and the 6th builder (O.T.T.O / B.O.B's hut) first
+# Builder Base without a plan of your own: these key buildings first (then the priciest affordable)
 BB_DEFAULT_ROWS = [{"name": n, "base": "builder", "th": ""} for n in
                    ("builder hall", "ottos outpost", "battle machine", "battle copter", "builder barracks",
                     "star laboratory", "clock tower")]
@@ -2638,7 +2632,6 @@ class Bot:
             buy = [r for r in rows if r[2]]
             it = self.plan_items(kind)[i]
             res = wiki_data()[it["key"]]["levels"][0]["res"]
-            other = None
             if not buy and kind == "bb_builder":
                 self._bb_saving = res  # the Star Lab won't spend it meanwhile
                 if (free_before or 0) >= 2:  # a builder to spare (one stays free for the target): spend the
@@ -2646,8 +2639,7 @@ class Bot:
             if not buy and other is None:
                 self._upgrade_backoff[kind] = time.time() + 900
                 if kind == "builder":  # farm home until it's bought - the Builder Base waits, the list stays shut
-                    self._saving_home = (self._last_name, min(p for _, p, _ in rows),
-                                         wiki_data()[it["key"]]["levels"][0]["res"], time.time() + 3600)
+                    self._saving_home = (self._last_name, min(p for _, p, _ in rows), res, time.time() + 3600)
                 self.back_to_village(icon)
                 return self.log(f"{KIND_NAMES[kind]}: next in the plan is {wiki_data()[it['key']]['name']} -> "
                                 f"{it['to']} ({min(p for _, p, _ in rows):,}) - farming until it's affordable"
@@ -3849,7 +3841,7 @@ PAN_DIRS = {"top-left": (1, 1), "top-right": (-1, 1), "bottom-left": (1, -1), "b
             "left": (1, 0), "right": (-1, 0), "top": (0, 1), "bottom": (0, -1)}
 
 
-def pan_view(adb, where, frame_w=1920, frame_h=1080):
+def pan_view(adb, where, frame_w=1920):
     """Drag the battle camera as far as it goes towards `where` (e.g. 'top-left' shows the map's top-left edge).
     The game stops at the map edge, so the view is identical every attack and saved drop points line up.
     Slow drags on the open map area (away from the buttons and troop bar) so nothing gets tapped or flung."""
@@ -4227,9 +4219,6 @@ class DropLinePicker(tk.Toplevel):
         self.destroy()
 
 
-PRETTY = {"ottos outpost": "O.T.T.O's Outpost", "x bow": "X-Bow", "builders hut": "Builder's Hut",
-          "multi archer tower": "Multi-Archer Tower", "multi gear tower": "Multi-Gear Tower"}
-pretty = lambda n: PRETTY.get(n, n.title())
 PLAN_CATS = ("All", "Heroes", "Army", "Defences", "Guardians", "Traps", "Resources", "Other")
 
 

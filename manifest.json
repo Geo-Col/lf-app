@@ -1,8 +1,8 @@
 {
- "version": 32,
+ "version": 33,
  "files": {
-  "bot.py": "55d110079bdb9cb5c20505f86d4404bf256fa81a0bf4a272e251add4702ad79f",
-  "setup.ps1": "c91f2e940d7bdcdd5b5d47eab965122bc239d7880636abda5206de79c25c69d0",
+  "bot.py": "01d94f11615dac283100b0ee74744ef528747b3f167999bbccf7357aae220403",
+  "setup.ps1": "3f4ed8e0b98b0fc30adf41469845bfef9c0f3fa68c5e7a0fc1d49e5a81cac766",
   "Setup.bat": "3d3ea502d691eccb7207f2d7388826a07c48f3f0c8eafa6c0a96df51b88bb8d3",
   "README.txt": "57d062e410301c98c6f86474af570802ccdbcc1a0723012e0e63ff2393dc6b08",
   ".gitignore": "3634583a98a69e99a720ea19320357f23b263b93d00596d54e0a454fb598ca18",
@@ -14,7 +14,6 @@
   "templates/bb_bonus_title.png": "5587cc11152f6e0fa8009dcaabb23700d69d65a7492ce9cd7ac71cd82dc95551",
   "templates/bb_boost_button.png": "57b7ed2f4ca810aee7976f4e6a9cfc87c0a54f40fc39cecf0ca54306ab5864db",
   "templates/bb_boost_title.png": "3e870ce64426a06b278bc9f87c5141e137da3f94e5e59b3a9809a0e70284771a",
-  "templates/bb_cart.png": "d12c5afd723fda446ec6d95e079864195cb67dea25788b34f913704a80a217f9",
   "templates/bb_cart_collect.png": "408bff072d4fcd5c2115fc903999de48436fedcf614e43223eca5fcf178d79be",
   "templates/bb_cart_title.png": "57747e9ac6374e308d692a31ceca6e53cfeec2732fe27e846af100530cef87e7",
   "templates/bb_clock_bubble.png": "a20b8aab25b772eb87fab8de96f3404025b152b17780e05d885cc7a87af30381",
@@ -44,8 +43,6 @@
   "templates/switch_account_button.png": "ee18db89c5972c891406eb194149fe432e1929e7b22732324eb476d273a5f291",
   "templates/upgrade_more_button.png": "0e0e12208be6355a5b37c2dabb2da27ef574376e21bdcf64a92b12b8d92a65ff",
   "templates/upgrade_more_disabled.png": "639c5a4898e7448babbdd8d221c6e6e35175608c815ce1e90154d1a60db4e8d4",
-  "templates/wall_elixir_upgrade_button.png": "04258c369dd42479c57ab5200875beb560a54d793ea2f2673c351f5daadc3c81",
-  "templates/wall_gold_upgrade_button.png": "c57bf05bb697c249cadc51995924a4e4e8e13218a0d32f26c980fb09f5904b97",
   "templates/wall_okay_button.png": "7cea4834c382e5f135eb80d00865a74a3a526600bf421f3f0092ebeac73628bf",
   "templates/wall_upgrade_hammers.png": "95a713ab0539e3572f77b6b633cb2eb6e5ed2aff76c50236264adeb291d81bd1",
   "wiki/buildings.json": "282d7fc816e816a4145d8bcfc18d06b6727eafb34a2d855a459845666de89ca7",

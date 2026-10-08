@@ -132,7 +132,7 @@ else {
     Download "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" "$Here\cloudflared.exe"
     $sig = Get-AuthenticodeSignature "$Here\cloudflared.exe"
     if ($sig.Status -eq "Valid" -and $sig.SignerCertificate.Subject -like "*Cloudflare*") { Ok "downloaded (signed by Cloudflare)" }
-    else { Remove-Item "$Here\cloudflared.exe"; Bad "signature check failed - removed it. The phone link will be home-Wi-Fi only." }
+    else { Remove-Item "$Here\cloudflared.exe"; Bad "signature check failed - removed it. The phone link won't work until Setup is run again." }
 }
 
 # ---------------------------------------------------------------- 6. BlueStacks
