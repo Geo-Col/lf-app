@@ -73,7 +73,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 33  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 34  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -112,6 +112,7 @@ BUTTONS = [
     ("bb_return_home", "Builder Base Return Home  - builder base"),
     ("bb_elixir_bubble", "Builder Base elixir bubble  - builder base"),
     ("bb_gold_bubble", "Builder Base gold bubble  - builder base"),
+    ("bb_cart", "Elixir Cart, full (by the dock)  - builder base"),
     ("bb_cart_title", "Elixir Cart window title  - builder base"),
     ("bb_cart_collect", "Elixir Cart green Collect  - builder base"),
     ("bb_bonus_title", "'Star Bonus!' popup title  - builder base"),
@@ -905,7 +906,8 @@ def troop_bar(frame):
             x, y, w, h = st[i, :4]
             if 0.013 * H <= h <= 0.02 * H and 3 <= w <= 0.016 * W:
                 around = cc[max(0, y - 4):y + h + 4, max(0, x - 4):x + w + 4]
-                if float(around[:, :, 2][around[:, :, 2] <= 200].mean()) < 110:
+                dark = around[:, :, 2][around[:, :, 2] <= 200]
+                if dark.size and float(dark.mean()) < 110:
                     return True
         return False
 
@@ -1604,8 +1606,7 @@ class Bot:
         if self.mode.startswith("bb_"):
             return self.bb_only()
         self.bb_bonus(self._last_name or "?")
-        self.bb_collect()
-        if not self.take_boat("home"):
+        if not self.take_boat("home"):  # collects (cart too) first
             self.log("On the Builder Base and couldn't take the boat home - relaunching the game.", "warn")
             self.recover_game("stuck on the Builder Base")
 
@@ -1613,7 +1614,7 @@ class Bot:
         self.tap(self.hits["return_home_button"], self.cfg["return_home_delay"])
 
     def on_battle(self, frame, prev):
-        left = [c for c in troop_bar(frame) if c[2] in ("troop", "spell") and c[3]]
+        left = [c for c in troop_bar(frame) if c[3] and (c[2] == "troop" or c[2] == "spell" and self.cfg["deploy_spells"])]
         if left:
             # A fresh base shows 'End Battle' a moment before 'Next' appears: give it a few seconds to be scouting.
             nxt = self.wait_for("next_button", 3, poll=0.5)
@@ -2218,6 +2219,8 @@ class Bot:
         L, R, U, D = (600, 500, 1300, 500), (1300, 500, 600, 500), (960, 300, 960, 700), (960, 700, 960, 300)
         usual = [(700, 450, 1300, 250)] * 3 if to == "builder" else [(1300, 300, 800, 600)] * 3
         sweep = usual + [L] * 3 + [U] * 2 + [R] * 5 + [D] * 4 + [L] * 5 + [U] * 2
+        if to == "home":
+            self.bb_collect()  # collectors + the Elixir Cart before leaving (it moves the camera, so first)
         for _ in range(2):
             boat = self.find_any_zoom(self.shot(), "bb_boat")
             if not boat:  # zoomed in (e.g. after an upgrade on the far village): zoom out so the sweep covers the map
@@ -2231,9 +2234,6 @@ class Bot:
                 self.sleep(0.9)
                 boat = self.find_any_zoom(self.shot(), "bb_boat")
             if boat:
-                if to == "home":
-                    self.bb_collect()
-                    boat = self.find_any_zoom(self.shot(), "bb_boat") or boat
                 if boat[1] < 200 or boat[0] > 1500:  # under the resource bars: a tap there opens the bar's
                     # tooltip (which then hides the boat) - drag the map to bring the boat toward the middle
                     self.adb.swipe(960, 540, 960 + (960 - boat[0]) // 2, 540 + (540 - boat[1]) // 2, 600)
@@ -2274,8 +2274,8 @@ class Bot:
         self.sleep(1.0)
 
     def bb_cart(self):
-        """The Elixir Cart stands by the dock, just left of the boat, often off the top of the screen. Zoomed all
-        the way out it's always at the same spot next to the boat: bring the dock on screen, tap the cart."""
+        """The Elixir Cart stands by the dock, next to the boat - often off the top of the screen. Bring the dock
+        into the middle, then tap the cart (found by its bubble / look / usual spot)."""
         zoom_out(self.adb)
         self.sleep(0.8)
         boat = self.find_any_zoom(self.shot(), "bb_boat")
@@ -2285,26 +2285,28 @@ class Bot:
             self.adb.swipe(1300, 300, 800, 600, 450)
             self.sleep(0.9)
             boat = self.find_any_zoom(self.shot(), "bb_boat")
-        if not boat:
+        if not boat:  # the boat hides behind the side buttons at the map's edge - but the cart's bubble may show
+            f = self.shot()
+            for xy in [p for p in self.matches(f, "bb_elixir_bubble", 0.7) if 250 < p[0] < 1650 and 150 < p[1] < 820]:
+                self.tap(xy, 1.2)
+                if self.find(self.shot(), "bb_cart_title"):
+                    return self.cart_window()
             return
-        cart = lambda b: (b[0] - 295, b[1] + 199)
-        cx, cy = cart(boat)
-        if not (250 < cx < 1450 and 200 < cy < 800):  # off screen / under a button: drag it into the middle
-            self.adb.swipe(960, 540, 960 + 1250 - boat[0], 540 + 380 - boat[1], 900)
-            self.sleep(1.2)
-            boat = self.find_any_zoom(self.shot(), "bb_boat")
-            if not boat:
-                return
-            cx, cy = cart(boat)
-            if not (250 < cx < 1450 and 200 < cy < 800):
-                return
-        for _ in range(2):  # the map glides on after a drag: tap where the boat is once it has settled
-            self.sleep(0.8)
-            boat = self.find_any_zoom(self.shot(), "bb_boat") or boat
-            cx, cy = cart(boat)
-            if not (250 < cx < 1450 and 200 < cy < 800):
-                return
-            self.tap((cx, cy), 1.2)
+        if abs(boat[0] - 1150) > 120 or abs(boat[1] - 520) > 120:  # dock into the middle: the cart is beside it
+            self.adb.swipe(960, 540, 960 + 1150 - boat[0], 540 + 520 - boat[1], 900)
+        self.sleep(1.5)  # the map glides on after a drag
+        f = self.shot()
+        boat = self.find_any_zoom(f, "bb_boat") or boat
+        near = lambda p: (abs(p[0] - boat[0]) < 650 and abs(p[1] - boat[1]) < 450 and 250 < p[0] and 120 < p[1] < 820
+                          and (p[0] < 1450 or p[1] > 320))  # ...and clear of the resource bars / buttons
+        # where the cart is: its bubble (shows when there's elixir in it - an empty cart has nothing to collect) or
+        # its full look. Never a guessed spot: the dock's layout differs by Builder Hall level, and a blind tap can
+        # select an obstacle ('Remove').
+        spots = sorted(filter(near, self.matches(f, "bb_elixir_bubble", 0.7)),
+                       key=lambda p: abs(p[0] - boat[0]) + abs(p[1] - boat[1]))
+        spots += list(filter(near, filter(None, [self.find_any_zoom(f, "bb_cart", 0.75)])))
+        for xy in spots[:3]:
+            self.tap(xy, 1.2)
             if self.find(self.shot(), "bb_cart_title"):
                 return self.cart_window()
 
@@ -2412,7 +2414,7 @@ class Bot:
         self.bb_collect()
         self.bb_clock_boost()  # first, while the arrival view shows the whole base (its bubble is on the tower)
         self.bb_session(name, upgrades=True)
-        self.take_boat("home")  # the boat view also shows the Elixir Cart: collect it (new defense rewards) first
+        self.take_boat("home")  # collects again first: the session's attacks filled the Elixir Cart
         return True
 
     def bb_session(self, name, upgrades=True):
@@ -3332,7 +3334,10 @@ class Bot:
                 self.emit("state", f"Home village ({self._last_name})")
                 return True
             if self.find(f, "wall_okay_button") or time.time() > end - 60 + 6 * (backs + 1):
-                self.adb.back()  # 'Welcome back' / news popups; Back never confirms anything
+                if backs >= 2 and backs % 2 == 0 and self.groq_on("groq_supervisor"):
+                    self.groq_rescue(f)  # e.g. an event character's speech bubble: a tap moves it on, Back doesn't
+                else:
+                    self.adb.back()  # 'Welcome back' / news popups; Back never confirms anything
                 backs += 1
             self.sleep(2.0)
         return self.switch_fail(f"{name} didn't reach its village")
@@ -3386,7 +3391,7 @@ class Bot:
         troops = [cd for cd in cards if cd[2] == "troop" and cd[3]]
         spells = [cd for cd in cards if cd[2] == "spell" and cd[3]] if self.cfg["deploy_spells"] else []
         singles = [cd for cd in cards if cd[2] in ("hero", "single")]
-        if not troops and not singles:
+        if not troops and not singles and not spells:
             return False
         fp = self.cfg["fixed_points"]
         if fp.get("spell_point"):  # their own line, if set
