@@ -73,7 +73,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 31  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 32  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1127,6 +1127,15 @@ def walls_left(sd):
                 todo += r.get("count", 1)
                 cost += r.get("count", 1) * sum(x["cost"] for x in e["levels"] if r["level"] < x["level"] <= mx)
     return counts, mx, todo, cost
+
+
+def clipboard_usable():
+    """False while Windows can't hand out its clipboard - e.g. the PC is locked (then the export can't arrive)."""
+    try:
+        return subprocess.run(["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"], capture_output=True,
+                              text=True, timeout=15, creationflags=NO_WINDOW).returncode == 0
+    except Exception:
+        return False
 
 
 def read_clipboard():
@@ -2251,20 +2260,59 @@ class Bot:
         # only bubbles in the open middle: one sitting over the edge buttons (Season Pass, Attack, Shop, the
         # resource bars...) would tap that button instead. It gets collected another time.
         safe = lambda p: 0.13 * W < p[0] < 0.87 * W and 0.11 * H < p[1] < 0.76 * H
-        # the Elixir Cart sits up by the dock: its bubble is often off the top edge, so tap the cart itself
-        cart = self.find_any_zoom(f, "bb_cart", 0.75)
-        cart = [cart] if cart and 0.13 * W < cart[0] < 0.76 * W and cart[1] < 0.76 * H else []
-        for xy in cart + list(filter(safe, self.matches(f, "bb_elixir_bubble", 0.7)
-                                     + self.matches(f, "bb_gold_bubble", 0.7) + self.matches(f, "bb_gem_bubble", 0.7))):
+        for xy in filter(safe, self.matches(f, "bb_elixir_bubble", 0.7) + self.matches(f, "bb_gold_bubble", 0.7)
+                         + self.matches(f, "bb_gem_bubble", 0.7)):
             self.tap(xy, 1.0)
-            f = self.shot()
-            if self.find(f, "bb_cart_title"):
-                btn = self.find(f, "bb_cart_collect")
-                if btn:
-                    self.tap(btn, 1.2)
-                    self.log("Builder Base: collected the Elixir Cart.", "ok")
-                self.adb.back()
-                self.sleep(1.0)
+            if self.find(self.shot(), "bb_cart_title"):  # that bubble was the cart's
+                self.cart_window()
+        self.bb_cart()
+
+    def cart_window(self):
+        """The Elixir Cart window is open: Collect if the button is green (grey = nothing in it), then close."""
+        f = self.shot()
+        btn = self.find(f, "bb_cart_collect")
+        if btn:
+            hsv = cv2.cvtColor(f[btn[1] - 25:btn[1] + 25, btn[0] - 90:btn[0] + 90], cv2.COLOR_BGR2HSV)
+            if ((hsv[:, :, 0] > 30) & (hsv[:, :, 0] < 90) & (hsv[:, :, 1] > 120)).mean() > 0.25:
+                self.tap(btn, 1.2)
+                self.log("Builder Base: collected the Elixir Cart.", "ok")
+        self.adb.back()
+        self.sleep(1.0)
+
+    def bb_cart(self):
+        """The Elixir Cart stands by the dock, just left of the boat, often off the top of the screen. Zoomed all
+        the way out it's always at the same spot next to the boat: bring the dock on screen, tap the cart."""
+        zoom_out(self.adb)
+        self.sleep(0.8)
+        boat = self.find_any_zoom(self.shot(), "bb_boat")
+        for _ in range(4):  # the dock is at the top right of the island: look that way (as the boat trip does)
+            if boat:
+                break
+            self.adb.swipe(1300, 300, 800, 600, 450)
+            self.sleep(0.9)
+            boat = self.find_any_zoom(self.shot(), "bb_boat")
+        if not boat:
+            return
+        cart = lambda b: (b[0] - 295, b[1] + 199)
+        cx, cy = cart(boat)
+        if not (250 < cx < 1450 and 200 < cy < 800):  # off screen / under a button: drag it into the middle
+            self.adb.swipe(960, 540, 960 + 1250 - boat[0], 540 + 380 - boat[1], 900)
+            self.sleep(1.2)
+            boat = self.find_any_zoom(self.shot(), "bb_boat")
+            if not boat:
+                return
+            cx, cy = cart(boat)
+            if not (250 < cx < 1450 and 200 < cy < 800):
+                return
+        for _ in range(2):  # the map glides on after a drag: tap where the boat is once it has settled
+            self.sleep(0.8)
+            boat = self.find_any_zoom(self.shot(), "bb_boat") or boat
+            cx, cy = cart(boat)
+            if not (250 < cx < 1450 and 200 < cy < 800):
+                return
+            self.tap((cx, cy), 1.2)
+            if self.find(self.shot(), "bb_cart_title"):
+                return self.cart_window()
 
     def bb_bonus(self, name):
         """Collect the 'Star Bonus!' popup if it's showing. True if one was collected just now."""
@@ -2923,6 +2971,13 @@ class Bot:
     def export_village(self):
         """Settings > More Settings > Data Export 'Copy': the game's own JSON with every level, both villages.
         Read back from the Windows clipboard. None if any step didn't work (then the list is read instead)."""
+        if not clipboard_usable():
+            if not getattr(self, "_clip_warned", False):
+                self._clip_warned = True
+                self.log("Upgrade planner: Windows' clipboard isn't available (is the PC locked?) - reading the "
+                         "builder lists instead of the game's data export until it is.", "warn")
+            return None
+        self._clip_warned = False
         self.back_to_village()
         f = self.shot()
         k = f.shape[1] / 1920
@@ -2957,17 +3012,23 @@ class Bot:
                 y = settings_drag_start(f) or int(880 * k)
                 self.adb.swipe(int(500 * k), y, int(500 * k), max(int(160 * k), y - int(650 * k)), 700)
                 self.sleep(0.8)
-            if hit:
+            before = read_clipboard() if hit else ""  # only a NEW export counts - never another account's old one
+            for attempt in range(2) if hit else ():  # a 2nd Copy if the clipboard didn't get it (slow to sync)
+                self.sleep(0.6)  # the page glides on after a drag: tap where the row has settled
+                hit = self.v.find(self.shot(), "export_copy_row", 0.9) or hit
                 self.tap((hit[0] + int(398 * k), hit[1]), 1.0)  # the green Copy button at the row's right
                 for _ in range(5):
                     try:
-                        d = json.loads(read_clipboard())
+                        raw = read_clipboard()
+                        d = json.loads(raw) if raw != before else {}
                         if d.get("tag") and d.get("buildings") and abs(time.time() - d.get("timestamp", 0)) < 900:
                             data = d
                             break
                     except (ValueError, AttributeError):
                         pass
                     self.sleep(1.0)
+                if data:
+                    break
         if not data:  # which step: for the debug report
             cv2.imwrite(os.path.join(BASE_DIR, "debug_export.png"), self.shot())
             log_file.info("export failed: " + ("no More Settings button" if not more else "no Copy row found"
