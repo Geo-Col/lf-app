@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 42  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 43  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -321,7 +321,7 @@ SETTINGS = [
 ]
 
 RUNTIME_KEYS = ("scans", "plans", "account_tags", "_last_account_idx", "loot_rate", "line_view", "ui_mode",
-                "sc_of_tag", "shortcuts_v")  # saved by the bot, not settings
+                "sc_of_tag", "shortcuts_v", "sc_accounts")  # saved by the bot, not settings
 # Rarely-touched tuning: shown under 'Show advanced settings'
 ADVANCED = {"loot_settle_delay", "loot_recheck_delay", "loot_max_plausible", "hold_deploy", "damage_confirm_count",
             "timer_poll_interval", "hold_ms_per_troop",
@@ -1556,9 +1556,20 @@ class Bot:
         n = self._last_name
         return bool(n) and " (" not in n and n != getattr(self, "_tag_ok", None) and any(k.startswith(n + " (") for k in self.cfg.get("scans") or {})
 
+    def phone_switch(self):
+        """An account picked on the phone view: switch now (we're on a village). True if one was waiting."""
+        sc, self.switch_req = getattr(self, "switch_req", None), None
+        if not sc:
+            return False
+        self.log(f"Phone: switching to {sc}.", "ok")
+        self.switch_account(target=sc)
+        return True
+
     def on_home(self, frame, prev):
         self.game_relaunches = 0
         self._view = None
+        if self.phone_switch():
+            return
         self.account_name(frame)
         if self.ambiguous() and self.mode != "loot" and time.time() >= getattr(self, "_amb_try", 0):
             self._amb_try = time.time() + 600  # the export's player tag says which one (then account_name knows)
@@ -1622,6 +1633,8 @@ class Bot:
 
     def on_bbhome(self, frame, prev):
         """On the Builder Base outside a visit (a restart, a crash, a stray boat tap): collect and sail home."""
+        if self.phone_switch():
+            return
         if self.mode.startswith("bb_"):
             return self.bb_only()
         self.bb_bonus(self._last_name or "?")
@@ -2049,9 +2062,17 @@ class Bot:
     def upgrade_pair(self, frame):
         """The Upgrade More bar's two double-hammer Upgrade buttons as (gold, elixir) - gold is always the left one.
         Matched on the hammers only, so the price (1,500,000 / 5,000,000 ...) doesn't matter. None if not showing."""
+        hits = self.wall_hammers(frame)
+        if len(hits) != 2 or abs(hits[0][0] - hits[1][0]) < 80 * frame.shape[1] / 1920:
+            return None
+        return tuple(hits)
+
+    def wall_hammers(self, frame):
+        """The Upgrade More bar's double-hammer Upgrade buttons, left to right: home has gold + elixir, the Builder
+        Base just Builder Gold (until its walls take Builder Elixir too)."""
         t = self.v.template("wall_upgrade_hammers")
         if t is None:
-            return None
+            return []
         small = cv2.resize(frame, None, fx=SCALE, fy=SCALE, interpolation=cv2.INTER_AREA)
         res = cv2.matchTemplate(small, t[2], cv2.TM_CCOEFF_NORMED)
         th, tw = t[1]
@@ -2063,14 +2084,12 @@ class Bot:
             hits.append((int(loc[0] / SCALE + tw / 2), int(loc[1] / SCALE + th / 2)))
             x0, y0 = loc
             res[max(0, y0 - th // 4):y0 + th // 4, max(0, x0 - tw // 2):x0 + tw // 2] = -1  # next peak elsewhere
-        if len(hits) != 2 or abs(hits[0][0] - hits[1][0]) < 80 * frame.shape[1] / 1920:
-            return None
-        return tuple(sorted(hits))
+        return sorted(h for h in hits if abs(h[1] - hits[0][1]) < 40)  # same bar row
 
-    def select_wall(self):
-        """Open the builder list, tap a 'Wall' row once the list has stopped sliding, close the list. Returns
-        the Upgrade More button if a wall really is selected (only walls have it), else None."""
-        icon = top_bar(self.shot(), "builder")[0]
+    def select_wall(self, kind="builder"):
+        """Open the builder list (kind 'bb_builder': the Builder Base's), tap a 'Wall' row once the list has stopped
+        sliding, close the list. Returns the Upgrade More button if a wall really is selected, else None."""
+        icon = top_bar(self.shot(), kind)[0]
         frame = self.shot()
         rows = self.find_wall_rows(frame)
         if not rows:  # list not open yet
@@ -2090,7 +2109,10 @@ class Bot:
                     break  # list stopped moving: reached the bottom
                 prev = roi
                 self.scroll_panel(box)  # inside the list only
+        self._no_wall_rows = not rows  # no 'Wall' row anywhere on the list: every wall is max
         if not rows:
+            if panel_box(self.shot()):
+                self.tap(icon, 1.0)
             return None
         for _ in range(6):  # wait until two reads agree on where the row is (the list glides after a swipe)
             self.sleep(0.4)
@@ -2117,30 +2139,34 @@ class Bot:
         if panel_box(f):  # the list sometimes stays open over the buttons: its icon closes it
             self.tap(icon, 1.2)
         name = self.selected_label(self.shot())[0]
-        other = wiki_key(name, "home") if name else None  # only walls have Upgrade More - this just catches a
-        if other and other != "home:wall":                # clearly different building ('Cannon (Level 21)')
+        other = (wiki_key(name, "home") if kind == "builder" else None if is_wall(name) else name) if name else None
+        if other and other != "home:wall":  # only walls have Upgrade More - this catches a clearly different
+            # building ('Cannon (Level 21)')
             self.log(f"Wall upgrade: the tap selected '{name}', not a wall.", "warn")
             return None
         end = time.time() + 3  # only walls have 'Upgrade More' (greyed/red when it's the only wall of its level)
         while True:
             f = self.shot()
-            if self.upgrade_pair(f):  # Upgrade More bar already open: its greyed 'Remove Wall' isn't Upgrade More
+            if (self.upgrade_pair(f) if kind == "builder" else self.wall_hammers(f)):  # Upgrade More bar already
+                # open: its greyed 'Remove Wall' isn't Upgrade More
                 return "open"
             hit = self.find(f, "upgrade_more_button") or self.find(f, "upgrade_more_disabled")
             if hit or time.time() > end:
                 return hit
             self.sleep(0.5)
 
-    def buy_wall(self, cur, balance=None):
+    def buy_wall(self, cur, balance=None, kind="builder"):
         """Builder list -> 'Wall' row (selects a wall) -> close list -> Upgrade More -> Upgrade in `cur`
-        -> Okay, but only if the dialog really says it upgrades Walls for `cur` (never gems)."""
+        -> Okay, but only if the dialog really says it upgrades Walls for `cur` (never gems). kind 'bb_builder':
+        the Builder Base's walls (its Upgrade More bar starts at 1 wall: Add Wall until it's what we can pay)."""
+        bb = kind == "bb_builder"
         region = self.cfg["ocr_regions"].get(f"bank_{cur}_region")
         frame = self.shot()
         if balance is None and region:
             balance = white_number(frame, region)
         for attempt in range(3):  # a slid list can land the tap on the wrong building: just try again
             # always a fresh pick from the list: a bar left from the last purchase holds walls a level higher now
-            more = self.select_wall()
+            more = self.select_wall(kind)
             if more:
                 break
             self.log(f"Wall upgrade: didn't get a wall selected (attempt {attempt + 1}/3) - retrying.")
@@ -2167,19 +2193,33 @@ class Bot:
                 self.tap(more, 1.2)
             pair, end = None, time.time() + 4
             while not pair and time.time() < end:
-                pair = self.upgrade_pair(self.shot())
+                pair = self.wall_hammers(self.shot()) if bb else self.upgrade_pair(self.shot())
                 if not pair:
                     self.sleep(0.4)
-            if not pair:
+            if not pair or (cur != "gold" and len(pair) < 2):
                 return self.wall_fail("Upgrade More bar's Upgrade buttons not found", self.shot())
             btn = pair[0] if cur == "gold" else pair[1]
-            for _ in range(20):  # Upgrade More selects a whole row: drop walls (-1) until it's affordable
+            k = f.shape[1] / 1920
+            # bar layout: home - Remove Wall, Add +10, Add +1, gold, elixir; Builder Base - Remove Wall, Add Wall, gold..
+            remove = (pair[0][0] - int((424 if bb else 612) * k), pair[0][1] + int(12 * k))
+            if bb and balance:  # Builder Base: it starts with 1 wall - add walls while the next one is affordable
+                unit = self.bar_price(self.shot(), btn)
+                add = (pair[0][0] - int(212 * k), pair[0][1] + int(12 * k))
+                cost, same = unit, 0
+                while unit and cost and cost + unit <= balance and same < 2:  # quick bursts, then re-read the total
+                    for _ in range(min((balance - cost) // unit, 20)):     # (taps that fast can drop a few)
+                        self.adb.tap(*add)
+                        time.sleep(0.15)
+                    self.sleep(0.6)
+                    new = self.bar_price(self.shot(), btn)
+                    same = same + 1 if new == cost else 0  # no more walls of this level to add
+                    cost = new
+            for _ in range(20):  # home: Upgrade More selects a whole row - drop walls (-1) until it's affordable
                 f = self.shot()
                 cost = self.bar_price(f, btn)
                 if cost is None or balance is None or cost <= balance:
                     break
-                k = f.shape[1] / 1920  # bar layout is fixed: Remove Wall, Add +10, Add +1, gold Upgrade, elixir Upgrade
-                self.tap((pair[0][0] - int(612 * k), pair[0][1] + int(12 * k)), 0.7)
+                self.tap(remove, 0.7)
             self.tap(btn, 1.2)
         ok = self.wait_for("wall_okay_button", 3 if want is None else 1)  # it animates in (slower at 30 FPS)
         frame = self.shot()
@@ -2563,6 +2603,38 @@ class Bot:
         if any(gain):
             self.log(f"{name}: +{gain[0]:,} Builder Gold, +{gain[1]:,} Builder Elixir")
 
+    def bb_walls(self, name):
+        """'BB walls': upgrade Builder Base walls whenever Builder Gold (or Builder Elixir, for walls that take it)
+        pays for one; otherwise attack a round to farm more. Stops once every wall is max."""
+        f = self.shot()
+        store = self.read_storage(f, village="builder")
+        bought = False
+        if self.free_slots(f, "bb_builder") == 0:
+            self.log("BB walls: every Builder Base builder is busy (walls need a free one) - farming a round.")
+        else:
+            for cur in ("gold", "elixir"):
+                bal = store.get(cur)
+                if not bal or time.time() < self._bank_backoff.get("bb_" + cur, 0):
+                    continue
+                if self.buy_wall(cur, bal, "bb_builder"):  # counts + logs it
+                    bought = True
+                    store = self.read_storage(self.shot(), village="builder")
+                elif getattr(self, "_no_wall_rows", False):
+                    self.log("BB walls: no walls left to upgrade on the Builder Base - stopping.", "ok")
+                    self.stop_evt.set()
+                    raise Abort()
+                else:  # can't afford one in this resource (or its walls don't take it): farm, look again later
+                    self._bank_backoff["bb_" + cur] = time.time() + (600 if cur == "gold" else 3600)
+        if bought:
+            return  # look again: there may be enough for more
+        for _ in range(5):
+            self.bb_bonus(name)
+            if not self.find(self.shot(), "bb_attack_button") and not self.wait_for("bb_attack_button", 20):
+                return
+            self.bb_attack()
+        self._bank_backoff.pop("bb_gold", None)  # new loot: try again
+        self.bb_collect()
+
     def bb_only(self):
         """'Builder Base only' modes: stay on the Builder Base.
         bb_loot: attack non-stop on this account, claiming the Elixir Cart every 10 attacks.
@@ -2576,6 +2648,8 @@ class Bot:
         self.bb_bonus(name)
         self.bb_collect()
         self.bb_clock_boost()
+        if self.mode == "bb_walls":
+            return self.bb_walls(name)
         if self.mode == "bb_loot":  # loot only: a plain loop on this account - attack, attack, attack; claim the
             for _ in range(10):     # Elixir Cart every 10 attacks. No Star Bonus counting, upgrades or switching.
                 self.bb_bonus(name)  # a Star Bonus popup can still show up: collect it and carry on
@@ -3232,7 +3306,8 @@ class Bot:
             th = next((t for t, x, y in words if abs(y - ty) < 6 and 0 < x - tx < 160 and t.isdigit()), None)
             game = next((t for t, x, y in words if 15 < y - name[2] < 40 and 0 < x - name[1] < 140
                          and len(t) > 2), "")
-            rows.append({"sc": name[0], "game": game, "th": int(th) if th else None, "xy": (name[1], name[2])})
+            rows.append({"sc": name[0], "game": game, "th": (int(th) if int(th) <= 20 else int(th[1:] or 0) or None) if th else None,  # ':' -> '7': '718'
+                         "xy": (name[1], name[2])})
         return rows
 
     def all_accounts(self):
@@ -3249,6 +3324,10 @@ class Bot:
             self.adb.swipe(int(1620 * k), int(960 * k), int(1620 * k), int(620 * k), 700)  # inside the panel
             self.sleep(1.2)
             frame = self.shot()
+        known = [{"sc": r["sc"], "game": r["game"], "th": r["th"]} for r in seen.values()]
+        if known and known != self.cfg.get("sc_accounts"):  # for the phone view's account picker
+            self.cfg["sc_accounts"] = known
+            save_config(self.cfg)
         return list(seen.values())
 
     def tap_account(self, sc):
@@ -3294,10 +3373,11 @@ class Bot:
             self.log(f"Two accounts are called '{name}': this one's planner data is now under '{key}'.", "ok")
         return key
 
-    def switch_account(self):
-        """Settings cog -> blue switch button -> tap the next account on the Supercell ID list."""
+    def switch_account(self, target=None):
+        """Settings cog -> blue switch button -> tap the next account on the Supercell ID list (or `target`, a
+        Supercell ID name - picked on the phone view)."""
         # _switch_streak = accounts already left because they were busy; this one is busy too
-        if self._n_accounts and self._switch_streak + 1 >= self._n_accounts:
+        if not target and self._n_accounts and self._switch_streak + 1 >= self._n_accounts:
             self._switch_streak = 0
             if self.cfg["stop_when_all_busy"]:
                 self.log("Every account's builders and lab are busy - nothing left to do, stopping.", "ok")
@@ -3325,11 +3405,16 @@ class Bot:
         if not self.wait_for("supercell_id_header", 6):
             return self.switch_fail("Supercell ID list didn't open")
         rows = self.all_accounts()
-        wanted = {a.strip().lower() for a in self.cfg["accounts"].split(",") if a.strip()}
+        if target:
+            idx = next((i for i, r in enumerate(rows) if r["sc"] == target), None)
+            if idx is None:
+                return self.switch_fail(f"{target} isn't on the Supercell ID list")
+            self._acc_idx, self._switch_streak = idx - 1, -1  # the pick below lands on it; a fresh rotation
+        wanted = {a.strip().lower() for a in self.cfg["accounts"].split(",") if a.strip()} if not target else None
         if wanted:
             rows = [r for r in rows if r["sc"].lower() in wanted]
         self._n_accounts = len(rows)
-        if len(rows) < 2:
+        if len(rows) < 2 and not target:
             return self.switch_fail(f"need 2+ accounts to rotate, found {[r['sc'] for r in rows]}")
         # the one we're on: known exactly after a switch; at the start, the row whose in-game name (and Town Hall,
         # when two share a name) matches this account
@@ -3347,7 +3432,7 @@ class Bot:
             else:
                 cur = next((i for i, r in enumerate(rows) if self.same_game_name(r["game"], bare)
                             and (hall is None or r["th"] in (None, hall))), None)
-        self._acc_idx = ((cur if cur is not None else self._acc_idx) + 1) % len(rows)
+        self._acc_idx = ((cur if cur is not None and not target else self._acc_idx) + 1) % len(rows)
         row = rows[self._acc_idx]
         name = row["sc"]
         self.log(f"Switching account -> {name}", "ok")
@@ -3653,6 +3738,7 @@ max-height:260px;overflow:auto}
 <div class="card ctl"><select id="m"></select><button id="go" class="go">Start</button>
 <select id="pz"><option value="">Pause&hellip;</option><option value="15">15 min</option><option value="30">30 min</option>
 <option value="60">1 hour</option><option value="120">2 hours</option></select><button id="rg">Restart game</button>
+<select id="acc"></select><button id="sw">Switch account</button>
 <div id="cmsg"></div></div>
 <div class="row r3" id="rates"></div>
 <div class="row r2" id="store"></div>
@@ -3672,12 +3758,16 @@ $("m").onchange=()=>{if(RUN&&$("m").value!==MODE){confirm("Switch to "+$("m").se
 cmd({action:"start",mode:$("m").value}):($("m").value=MODE);}};
 $("pz").onchange=()=>{const v=$("pz").value;$("pz").value="";if(v&&confirm("Pause for "+v+" minutes?"))cmd({action:"pause",minutes:+v});};
 $("rg").onclick=()=>confirm("Restart Clash of Clans?")&&cmd({action:"restart_game"});
+$("sw").onclick=()=>{const a=$("acc").value;if(a&&confirm("Switch to "+a+"?"))cmd({action:"switch_account",account:a});};
 const STATS=[["runtime","Runtime"],["attacks","Attacks","king"],["walls","Walls","wall"],["upgrades","Upgrades","hammer"],
 ["switches","Switches","builder_icon"],["skipped","Skipped","shield"],["recoveries","Restarts"],["battery","Battery"]];
 async function tick(){try{const s=await (await fetch("status"+Q,{cache:"no-store"})).json();
 const st=$("state");st.textContent=s.state;st.className="pill"+(/idle|stopped/i.test(s.state)?" idle":/recover/i.test(s.state)?" off":"");
 $("mode").textContent=s.mode?"Mode: "+s.mode:"";
 if(s.modes&&!$("m").options.length)$("m").innerHTML=s.modes.map(([k,l])=>`<option value="${k}">${l}</option>`).join("");
+const A=s.accounts||[];if($("acc").options.length!==(A.length||1))$("acc").innerHTML=A.length?
+A.map(([k,l])=>`<option value="${k}">${l}</option>`).join(""):'<option value="">Accounts show after the first switch</option>';
+$("sw").disabled=!A.length;if(s.current_acc&&document.activeElement!==$("acc"))$("acc").value=s.current_acc;
 RUN=!!s.running;MODE=s.mode_key||"";if(document.activeElement!==$("m"))$("m").value=MODE;
 $("go").textContent=RUN?"Stop":"Start";$("go").className="go"+(RUN?" stop":"");
 if(s.resume_in>0)$("cmsg").textContent="Paused - starts again in "+Math.ceil(s.resume_in/60)+" min.";
@@ -3696,7 +3786,7 @@ $("f").src="frame.jpg"+Q+"&t="+Date.now();}catch(e){const st=$("state");st.textC
 tick();setInterval(tick,1500);</script></body></html>"""
 
 
-PHONE_ACTIONS = ("start", "stop", "pause", "restart_game")
+PHONE_ACTIONS = ("start", "stop", "pause", "restart_game", "switch_account")
 
 
 class PhoneView:
@@ -4197,10 +4287,11 @@ def battery():
 BG, CARD, MUTED, TEXT = "#1c1c1c", "#2b2b2b", "#9a9a9a", "#e6e6e6"
 SIDE, NAV_ON = "#141414", "#262b33"  # sidebar, selected page
 # what the mode picker shows: mode -> (title, one line, icon in wiki/ui)
-MODES = {"farm": ("Full farm", "Attacks, upgrades, walls", "king"), "loot": ("Loot only", "Just attack", "gold"),
+MODES = {"farm": ("Full farm", "Attacks + upgrades", "king"), "loot": ("Loot only", "Just attack", "gold"),
          "walls": ("Walls only", "Farm + buy walls", "wall"),
          "bb_loot": ("BB loot", "Builder Base attacks", "bgold"),
-         "bb_farm": ("BB farm", "Builder Base + upgrades", "builderhall")}
+         "bb_farm": ("BB farm", "BB upgrades", "builderhall"),
+         "bb_walls": ("BB walls", "Builder Base walls", "wall")}
 GREEN, AMBER, RED, BLUE, GOLD, PINK = "#4cc38a", "#e5b454", "#ff6b6b", "#57a6ff", "#f5c542", "#d77bff"
 LEVEL_COLORS = {"info": TEXT, "ok": GREEN, "warn": AMBER, "err": RED}
 UI_SCALE = 1.0  # set from the real DPI at startup so the layout isn't tiny on 150-200% displays
@@ -5331,6 +5422,9 @@ class App(tk.Tk):
             st["mode_key"] = self.bot.mode if self.bot else self.mode_var.get()
             st["modes"] = [[k, v[0]] for k, v in MODES.items()]
             st["resume_in"] = max(0, int(self._resume[0] - time.time())) if self._resume else 0
+            st["accounts"] = [[a["sc"], a["sc"] + (f" - {a['game']}" if a.get("game") else "")
+                               + (f" (TH{a['th']})" if a.get("th") else "")] for a in self.cfg.get("sc_accounts") or []]
+            st["current_acc"] = getattr(self.bot, "_cur_sc", None) if self.bot else None
             st["bb"] = self.bb_view
             st["mode"] = MODES[self.bot.mode if self.bot else self.mode_var.get()][0]
             st.update(state=self.state_label.cget("text"), log=list(self.recent))
@@ -5510,6 +5604,16 @@ class App(tk.Tk):
             self.log(f"📱 Phone: pause for {mins} min.", "ok")
             if running:
                 self.bot.stop_evt.set()
+        elif a == "switch_account":
+            sc = c.get("account")
+            if sc not in [x["sc"] for x in self.cfg.get("sc_accounts") or []]:
+                return self.log("📱 Phone: switch - that account isn't on the saved list.", "warn")
+            self.log(f"📱 Phone: switch to {sc} (at the next village screen).", "ok")
+            if not running:
+                self._resume = None
+                self.start_bot(mode, "phone")
+            if self.bot:
+                self.bot.switch_req = sc
         elif a == "restart_game":
             if running:
                 self.log("📱 Phone: restart the game.", "ok")
