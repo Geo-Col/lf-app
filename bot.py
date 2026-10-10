@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 40  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 41  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -115,6 +115,9 @@ BUTTONS = [
     ("bb_elixir_bubble", "Builder Base elixir bubble  - builder base"),
     ("bb_gold_bubble", "Builder Base gold bubble  - builder base"),
     ("bb_cart", "Elixir Cart, full (by the dock)  - builder base"),
+    ("chest_room", "Chest event: the chest room (left wall)  - events"),
+    ("chest_skip", "Chest event: the chest room's Skip  - events"),
+    ("chest_continue", "Chest event: reward Continue  - events"),
     ("bb_cart_title", "Elixir Cart window title  - builder base"),
     ("bb_cart_collect", "Elixir Cart green Collect  - builder base"),
     ("bb_bonus_title", "'Star Bonus!' popup title  - builder base"),
@@ -583,7 +586,13 @@ class Vision:
         return c
 
     def score(self, frame, name):
-        """(score, cx, cy) of the best match in full-res coords, or None if no template."""
+        """(score, cx, cy) of the best match in full-res coords, or None if no template. A '<name>_alt' template,
+        if there is one, is a second look of the same button (e.g. Attack! with an event chest on it): best of both."""
+        alt = self._score(frame, name + "_alt") if os.path.isfile(os.path.join(self.tdir, name + "_alt.png")) else None
+        r = self._score(frame, name)
+        return max(r, alt) if r and alt else r or alt
+
+    def _score(self, frame, name):
         t = self.template(name)
         if t is None:
             return None
@@ -1400,6 +1409,9 @@ class Bot:
         try:
             while True:
                 try:
+                    if getattr(self, "relaunch_req", False):  # asked from the phone
+                        self.relaunch_req = False
+                        self.recover_game("restart requested from the phone")
                     frame = self.shot()
                     if online is not True:
                         online = True
@@ -1425,6 +1437,8 @@ class Bot:
                             unknown_since = None
                         elif self.bb_bonus(self._last_name or "?"):  # the Star Bonus popup (home or Builder
                             unknown_since = None                     # Base) - known, so no need to ask Groq
+                        elif self.event_chest(frame):  # chest event: open it, take the reward
+                            unknown_since = None
                         elif self.find(frame, "wall_okay_button"):
                             self.log("Closing an Okay/Cancel dialog with Back (never confirms).")
                             self.adb.back()
@@ -1882,6 +1896,30 @@ class Bot:
                 self.log(f"Couldn't find '{name}'.", "warn")
                 return
             self.tap(hit, 0.8)
+
+    def event_chest(self, frame):
+        """Chest event (after a 'Claim Reward' victory): the chest room - tap the chest until it opens (4 hammer
+        taps for a common one), then the reward's Continue. Never Skip: that asks 'Skip Chest opening?' and needs a
+        Yes. The room is told by its scenery (Skip only shows sometimes). True if it was showing."""
+        in_room = lambda f: self.v.find(f, "chest_room", 0.78) or self.v.find(f, "chest_skip", 0.8)
+        hit = self.find(frame, "chest_continue")
+        if hit:
+            self.log("Event chest opened.", "ok")
+            self.tap(hit, 1.5)
+            return True
+        if not in_room(frame):
+            return False
+        for _ in range(10):
+            self.tap((960, 600), 0.8)
+            f = self.shot()
+            hit = self.find(f, "chest_continue")
+            if hit:
+                self.log("Event chest opened.", "ok")
+                self.tap(hit, 1.5)
+                return True
+            if not in_room(f):
+                return True  # moved on by itself
+        return True
 
     def pick_reward(self, frame):
         """'Pick a Reward!' (shown mid-battle at star milestones) covers Surrender until a card is taken. Take the
@@ -3601,6 +3639,10 @@ h2{font-size:12px;color:#9a9a9a;text-transform:uppercase;letter-spacing:.05em;ma
 .wall{padding:6px 0;border-bottom:1px solid #353535}.wall:last-child{border:0}.wall b{font-size:14px}
 .wall .n{color:#f5c542;font-weight:600;font-size:13px}.wall .ok{color:#4cc38a;font-weight:600;font-size:13px}
 .wall .m{color:#9a9a9a;font-size:12px}
+.ctl{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
+.ctl select,.ctl button{font:inherit;font-size:14px;border:0;border-radius:10px;padding:10px 12px;background:#3a3a3a;color:#e6e6e6}
+.ctl select{flex:1 1 140px}.ctl .go{background:#2f7d55;font-weight:700;min-width:90px}.ctl .go.stop{background:#a33a3a}
+.ctl #cmsg{flex-basis:100%;color:#9a9a9a;font-size:12px}
 #log{background:#141414;border-radius:12px;padding:10px;font:12px ui-monospace,Consolas,monospace;white-space:pre-wrap;
 max-height:260px;overflow:auto}
 @media(max-width:420px){.r4{grid-template-columns:repeat(2,1fr)}}
@@ -3608,6 +3650,10 @@ max-height:260px;overflow:auto}
 <header><img id="logo"><div><h1>Loot Farmer</h1><div class="sub" id="mode">&hellip;</div></div>
 <div class="pill idle" id="state">&hellip;</div></header>
 <img id="f" alt="">
+<div class="card ctl"><select id="m"></select><button id="go" class="go">Start</button>
+<select id="pz"><option value="">Pause&hellip;</option><option value="15">15 min</option><option value="30">30 min</option>
+<option value="60">1 hour</option><option value="120">2 hours</option></select><button id="rg">Restart game</button>
+<div id="cmsg"></div></div>
 <div class="row r3" id="rates"></div>
 <div class="row r2" id="store"></div>
 <div class="row r4" id="g"></div>
@@ -3617,11 +3663,24 @@ max-height:260px;overflow:auto}
 </div><script>
 const Q=location.search, ic=n=>"ui/"+n+".png"+Q, $=id=>document.getElementById(id);
 $("logo").src=ic("king");
+let RUN=false,MODE="";
+async function cmd(o){$("cmsg").textContent="Sending…";try{const r=await fetch("cmd"+Q,{method:"POST",
+headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});$("cmsg").textContent=(await r.json()).msg||"";}
+catch(e){$("cmsg").textContent="PC not reachable.";}setTimeout(tick,600);}
+$("go").onclick=()=>RUN?confirm("Stop farming?")&&cmd({action:"stop"}):cmd({action:"start",mode:$("m").value});
+$("m").onchange=()=>{if(RUN&&$("m").value!==MODE){confirm("Switch to "+$("m").selectedOptions[0].text+"?")?
+cmd({action:"start",mode:$("m").value}):($("m").value=MODE);}};
+$("pz").onchange=()=>{const v=$("pz").value;$("pz").value="";if(v&&confirm("Pause for "+v+" minutes?"))cmd({action:"pause",minutes:+v});};
+$("rg").onclick=()=>confirm("Restart Clash of Clans?")&&cmd({action:"restart_game"});
 const STATS=[["runtime","Runtime"],["attacks","Attacks","king"],["walls","Walls","wall"],["upgrades","Upgrades","hammer"],
 ["switches","Switches","builder_icon"],["skipped","Skipped","shield"],["recoveries","Restarts"],["battery","Battery"]];
 async function tick(){try{const s=await (await fetch("status"+Q,{cache:"no-store"})).json();
 const st=$("state");st.textContent=s.state;st.className="pill"+(/idle|stopped/i.test(s.state)?" idle":/recover/i.test(s.state)?" off":"");
 $("mode").textContent=s.mode?"Mode: "+s.mode:"";
+if(s.modes&&!$("m").options.length)$("m").innerHTML=s.modes.map(([k,l])=>`<option value="${k}">${l}</option>`).join("");
+RUN=!!s.running;MODE=s.mode_key||"";if(document.activeElement!==$("m"))$("m").value=MODE;
+$("go").textContent=RUN?"Stop":"Start";$("go").className="go"+(RUN?" stop":"");
+if(s.resume_in>0)$("cmsg").textContent="Paused - starts again in "+Math.ceil(s.resume_in/60)+" min.";
 const B=s.bb,I=k=>B&&k!="dark"?"b"+k:k;$("rates").className="row "+(B?"r2":"r3");
 const R=s.rates||{};$("rates").innerHTML=[["gold","gold"],["elixir","elixir"]].concat(B?[]:[["dark","dark"]]).map(([k,c])=>
 `<div class="c"><img src="${ic(I(k))}"><div style="min-width:0"><div class="v ${c}">${((R[k]||["—"])[0]).replace(" / h","").replace(/(\\.\\d)\\dM/,"$1M")}</div><div class="l">per hour</div><div class="l" style="text-transform:none">${((R[k]||["",""])[1]).replace(" this session"," total")}</div></div></div>`).join("");
@@ -3637,14 +3696,38 @@ $("f").src="frame.jpg"+Q+"&t="+Date.now();}catch(e){const st=$("state");st.textC
 tick();setInterval(tick,1500);</script></body></html>"""
 
 
-class PhoneView:
-    """Serves PHONE_PAGE, the latest frame and a status JSON. Read-only: nothing on it controls the bot."""
+PHONE_ACTIONS = ("start", "stop", "pause", "restart_game")
 
-    def __init__(self, port, key):
+
+class PhoneView:
+    """Serves PHONE_PAGE, the latest frame and a status JSON, and takes the page's commands (POST /cmd: start /
+    stop / pause / restart the game - nothing that taps the game or spends anything). The link's key is the only
+    lock, so the link is as good as the controls."""
+
+    def __init__(self, port, key, on_cmd=None):
         self.jpeg, self.status = b"", {"state": "Idle", "log": []}
         view = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                path, _, query = self.path.partition("?")
+                if f"k={key}" not in query.split("&") or path != "/cmd" or not on_cmd:
+                    self.send_error(403)
+                    return
+                try:
+                    cmd = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 2000)))
+                    ok = isinstance(cmd, dict) and cmd.get("action") in PHONE_ACTIONS
+                except (ValueError, TypeError):
+                    ok = False
+                if ok:
+                    on_cmd(cmd)
+                body = json.dumps({"ok": ok, "msg": "Sent to the PC." if ok else "Unknown command."}).encode()
+                self.send_response(200 if ok else 400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):
                 path, _, query = self.path.partition("?")
                 if f"k={key}" not in query.split("&"):
@@ -4707,13 +4790,14 @@ class App(tk.Tk):
         self.vision = Vision()
         self.recent = collections.deque(maxlen=10)
         self.phone, self.tunnel, self.public_url = None, None, ""
+        self._resume = None  # (when, mode): start again then - a pause / mode switch from the phone
         if not self.cfg["phone_view_key"]:
             self.cfg["phone_view_key"] = secrets.token_urlsafe(9)
             save_config(self.cfg)
         if self.cfg["phone_view_enabled"]:
             key, port = self.cfg["phone_view_key"], self.cfg["phone_view_port"]
             try:
-                self.phone = PhoneView(port, key)
+                self.phone = PhoneView(port, key, lambda cmd: self.emit("phone_cmd", cmd))
                 exe = os.path.join(BASE_DIR, "cloudflared.exe")
                 if self.cfg["public_link_enabled"] and os.path.isfile(exe):
                     self.tunnel = Tunnel(exe, port, lambda url: self.ui(lambda: self._public_url(url)))
@@ -5193,6 +5277,8 @@ class App(tk.Tk):
                     frame = data
                 elif kind == "device":
                     self._set_pill(data)
+                elif kind == "phone_cmd":
+                    self.phone_cmd(data)
                 elif kind == "devices":
                     self.dev_combo["values"] = data
                     if self.adb.device in data:
@@ -5241,6 +5327,10 @@ class App(tk.Tk):
             st["loot"] = getattr(self, "loot_view", [])
             st["rates"] = {k: [a.cget("text"), b.cget("text")] for k, (a, b) in self.rate_labels.items()}
             st["walls_view"] = getattr(self, "walls_view", [])
+            st["running"] = bool(self.thread)
+            st["mode_key"] = self.bot.mode if self.bot else self.mode_var.get()
+            st["modes"] = [[k, v[0]] for k, v in MODES.items()]
+            st["resume_in"] = max(0, int(self._resume[0] - time.time())) if self._resume else 0
             st["bb"] = self.bb_view
             st["mode"] = MODES[self.bot.mode if self.bot else self.mode_var.get()][0]
             st.update(state=self.state_label.cget("text"), log=list(self.recent))
@@ -5253,6 +5343,9 @@ class App(tk.Tk):
             self.started_at = None
             self.start_btn.config(state="normal")
             self.pick_mode(self.mode_var.get(), save=False)
+        if self._resume and not self.thread and time.time() >= self._resume[0]:  # end of a phone pause / switch
+            mode, self._resume = self._resume[1], None
+            self.start_bot(mode, "phone")
 
     def _append_log(self, level, msg):
         ts = time.strftime("%H:%M:%S ")
@@ -5354,6 +5447,7 @@ class App(tk.Tk):
         return miss
 
     def toggle(self, mode="farm"):
+        self._resume = None  # the PC's own Start / Stop overrides a pause set from the phone
         if self.thread:
             self.bot.stop_evt.set()
             self.start_btn.config(text="Stopping…", state="disabled")
@@ -5371,6 +5465,16 @@ class App(tk.Tk):
                 return
             self.cfg["line_view"] = 2
             save_config(self.cfg)
+        self.start_bot(mode)
+
+    def start_bot(self, mode, by=None):
+        """Start farming in `mode` (setup already checked). by='phone': from the live view - no dialogs."""
+        if by:
+            miss = self.missing_setup()
+            if miss:
+                return self.log("📱 Phone: can't start - finish Setup first (" + "; ".join(miss) + ").", "warn")
+            self.pick_mode(mode, save=False)
+            self.log(f"📱 Phone: start ({MODES[mode][0]}).", "ok")
         self.reset_dashboard()
         self.bot = Bot(self.cfg, self.adb, self.emit, mode)
         self.thread = threading.Thread(target=self.bot.run, daemon=True)
@@ -5383,6 +5487,35 @@ class App(tk.Tk):
         for k, card in self.mode_cards.items():
             if k != mode:
                 card.config(highlightbackground=CARD)
+
+    def phone_cmd(self, c):
+        """A button on the live view: start (a mode) / stop / pause N minutes / restart the game."""
+        a, mode = c.get("action"), c.get("mode") if c.get("mode") in MODES else self.mode_var.get()
+        running = bool(self.thread)
+        if a == "start":
+            if running and self.bot and self.bot.mode == mode:
+                return self.log("📱 Phone: already farming.")
+            self._resume = (time.time(), mode)  # starts as soon as the bot is stopped (now, if it isn't running)
+            if running:
+                self.log(f"📱 Phone: switching to {MODES[mode][0]}.", "ok")
+                self.bot.stop_evt.set()
+        elif a == "stop":
+            self._resume = None
+            if running:
+                self.log("📱 Phone: stop.", "ok")
+                self.bot.stop_evt.set()
+        elif a == "pause":
+            mins = max(5, min(int(c.get("minutes") or 30), 720))
+            self._resume = (time.time() + mins * 60, self.bot.mode if self.bot else mode)
+            self.log(f"📱 Phone: pause for {mins} min.", "ok")
+            if running:
+                self.bot.stop_evt.set()
+        elif a == "restart_game":
+            if running:
+                self.log("📱 Phone: restart the game.", "ok")
+                self.bot.relaunch_req = True
+            else:
+                self.log("📱 Phone: restart the game - the bot isn't running.", "warn")
 
     def res_icon(self, k):
         """'gold' -> 'bgold' etc. while the bot is on the Builder Base."""
