@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 48  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 49  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2099,6 +2099,10 @@ class Bot:
             did = True
             if self.buy_wall(cur, val):
                 self.walls_progress(getattr(self, "_wall_paid", 0))
+            elif getattr(self, "_no_wall_rows", False):  # no 'Wall' row on the list: they're all max here
+                self._bank_backoff.update(gold=time.time() + 6 * 3600, elixir=time.time() + 6 * 3600)
+                self.log("Walls: every wall on this account is max - not looking again for 6 h.", "ok")
+                break
             else:
                 self._bank_backoff[cur] = time.time() + 300
                 self.log(f"Couldn't buy a {cur} wall - trying again in 5 min.", "warn")
@@ -2170,6 +2174,7 @@ class Bot:
         icon = top_bar(self.shot(), kind)[0]
         frame = self.shot()
         rows = self.find_wall_rows(frame)
+        opened = bool(rows)
         if not rows:  # list not open yet
             self.tap(icon, 1.2)
             prev = None
@@ -2182,12 +2187,13 @@ class Bot:
                 if not box:  # not open (yet): never swipe then - it would drag the village (onto the boat...)
                     self.sleep(0.6)
                     continue
+                opened = True
                 roi = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)[150:-150:4, ::4]
                 if prev is not None and cv2.absdiff(roi, prev).mean() < 2:
                     break  # list stopped moving: reached the bottom
                 prev = roi
                 self.scroll_panel(box)  # inside the list only
-        self._no_wall_rows = not rows  # no 'Wall' row anywhere on the list: every wall is max
+        self._no_wall_rows = opened and not rows  # the list opened, scrolled to the end: no 'Wall' row = all max
         if not rows:
             if panel_box(self.shot()):
                 self.tap(icon, 1.0)
