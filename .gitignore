@@ -17,3 +17,5 @@ backups/
 config.json.*
 wiki_build.log
 build_wiki_data.py
+groq_screens/
+debug_*.png

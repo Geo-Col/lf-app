@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 46  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 47  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -116,6 +116,11 @@ BUTTONS = [
     ("bb_gold_bubble", "Builder Base gold bubble  - builder base"),
     ("bb_cart", "Elixir Cart, full (by the dock)  - builder base"),
     ("chest_room", "Chest event: the chest room (left wall)  - events"),
+    ("loading_logo", "Loading screen: Clash of Clans logo  - recovery"),
+    ("loading_text", "Loading screen: 'Loading' bar text  - recovery"),
+    ("popup_close", "A window's red X close button  - recovery"),
+    ("live_replay", "'Live Replay' (an attack on us, shown at login)  - recovery"),
+    ("replay_return_home", "Return Home after that replay  - recovery"),
     ("chest_skip", "Chest event: the chest room's Skip  - events"),
     ("chest_continue", "Chest event: reward Continue  - events"),
     ("bb_cart_title", "Elixir Cart window title  - builder base"),
@@ -567,7 +572,7 @@ SCALE = 0.5  # match at half resolution: ~4x faster, still precise to a couple o
 class Vision:
     def __init__(self, tdir=TEMPLATE_DIR):
         self.tdir = tdir
-        self._t = {}
+        self._t, self._alts = {}, {}
         self._frame = self._small = None
 
     def template(self, name):
@@ -586,11 +591,12 @@ class Vision:
         return c
 
     def score(self, frame, name):
-        """(score, cx, cy) of the best match in full-res coords, or None if no template. A '<name>_alt' template,
-        if there is one, is a second look of the same button (e.g. Attack! with an event chest on it): best of both."""
-        alt = self._score(frame, name + "_alt") if os.path.isfile(os.path.join(self.tdir, name + "_alt.png")) else None
-        r = self._score(frame, name)
-        return max(r, alt) if r and alt else r or alt
+        """(score, cx, cy) of the best match in full-res coords, or None if no template. '<name>_alt*' templates
+        are other looks of the same button (Attack! with an event chest on it, Claim Reward for Return Home...)."""
+        alts = [n[:-4] for n in self._alts.setdefault(name, sorted(
+            os.path.basename(f) for f in glob.glob(os.path.join(self.tdir, name + "_alt*.png"))))]
+        found = [r for r in [self._score(frame, name)] + [self._score(frame, n) for n in alts] if r]
+        return max(found) if found else None
 
     def _score(self, frame, name):
         t = self.template(name)
@@ -748,6 +754,8 @@ def read_digit_blobs(mask, suffix_ok=False):
         return None
     cy = np.median([st[i, 1] + st[i, 3] / 2 for i in comps])  # one text line: drop shapes above/below it
     comps = sorted((i for i in comps if abs(st[i, 1] + st[i, 3] / 2 - cy) <= 0.5 * h), key=lambda i: st[i, 0])
+    if not comps:  # nothing on one line (e.g. the loot numbers not drawn yet)
+        return None
     runs, cur = [], [comps[0]]
     for a, b in zip(comps, comps[1:]):  # split where the gap is wider than a digit (e.g. before the icon)
         if st[b, 0] - (st[a, 0] + st[a, 2]) <= h:
@@ -1439,11 +1447,24 @@ class Bot:
                             unknown_since = None                     # Base) - known, so no need to ask Groq
                         elif self.event_chest(frame):  # chest event: open it, take the reward
                             unknown_since = None
+                        elif self.loading_screen(frame):  # Supercell logo / loading art / clouds / a live replay
+                            self.sleep(1.0)                # of an attack on us: only waiting helps (watchdog still on)
+                        elif self.v.find(frame, "replay_return_home", 0.9):  # that replay ended (opening the game
+                            self.log("Leaving the replay of an attack on this village.")  # mid-attack shows it)
+                            self.tap(self.v.find(frame, "replay_return_home", 0.9), 2.0)
+                            unknown_since = None
+                        elif self.close_popup(frame):  # a window's red X: always just closes it
+                            unknown_since = None
                         elif self.find(frame, "wall_okay_button"):
                             self.log("Closing an Okay/Cancel dialog with Back (never confirms).")
                             self.adb.back()
                             self.sleep(1.0)
-                        elif (self.groq_on("groq_supervisor") and stuck >= 2.5 and time.time() - self._last_groq >= 5
+                        elif stuck >= 3 and backs == 0:  # most popups close with Back: try that before asking Groq
+                            self.log("Unrecognised screen - pressing Back once.")
+                            self.adb.back()
+                            backs += 1
+                            self.sleep(1.0)
+                        elif (self.groq_on("groq_supervisor") and stuck >= 6 and time.time() - self._last_groq >= 5
                               and (state := self.groq_rescue(frame))):
                             unknown_since = None
                             getattr(self, "on_" + state.lower())(frame, prev)
@@ -1770,6 +1791,15 @@ class Bot:
         if xy and not (0 <= xy[0] < frame.shape[1] and 0 <= xy[1] < frame.shape[0]):
             xy = None
         self.log(f"Groq: {screen} -> {action} {target!r} ({reason})")
+        try:  # keep the screens Groq had to explain (the last 60): each one is a case to teach the bot
+            d = os.path.join(BASE_DIR, "groq_screens")
+            os.makedirs(d, exist_ok=True)
+            tag = re.sub(r"[^a-z0-9]+", "-", f"{screen} {action} {target}".lower())[:50]
+            cv2.imwrite(os.path.join(d, time.strftime("%m%d_%H%M%S_") + tag + ".jpg"), frame)
+            for old in sorted(os.listdir(d))[:-60]:
+                os.remove(os.path.join(d, old))
+        except Exception:
+            pass
         state = GROQ_SCREENS.get(screen)
         if state and xy:
             name = next(n for n, st in STATES if st == state)
@@ -1932,6 +1962,31 @@ class Bot:
                 self.log(f"Couldn't find '{name}'.", "warn")
                 return
             self.tap(hit, 0.8)
+
+    def loading_screen(self, frame):
+        """Screens where the only right move is to wait: the black Supercell logo, the Clash loading art, and the
+        white clouds between screens ('Searching for opponents...' - Back there would cancel the search)."""
+        m = float(frame.mean())
+        if m < 30:
+            return True
+        if m > 165 and float(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 1].mean()) < 60:
+            return True
+        return bool(self.v.find(frame, "loading_text", 0.8) or self.v.find(frame, "loading_logo", 0.8)
+                    or self.v.find(frame, "live_replay", 0.85))
+
+    def close_popup(self, frame):
+        """A window's red X (events, league overview, settings, news...): tap it. Only a bright red one near the
+        top right - a dimmed X sits under another layer. True if it tapped."""
+        H, W = frame.shape[:2]
+        hit = self.find_any_zoom(frame, "popup_close", 0.6)
+        if not hit or hit[0] < 0.7 * W or hit[1] > 0.3 * H:
+            return False
+        c = frame[max(0, hit[1] - 30):hit[1] + 30, max(0, hit[0] - 30):hit[0] + 30].astype(int)
+        if ((c[:, :, 2] > 160) & (c[:, :, 2] - c[:, :, 1] > 90) & (c[:, :, 2] - c[:, :, 0] > 90)).mean() < 0.45:
+            return False
+        self.log("Closing a popup (its X).")
+        self.tap(hit, 1.2)
+        return True
 
     def event_chest(self, frame):
         """Chest event (after a 'Claim Reward' victory): the chest room - tap the chest until it opens (4 hammer
@@ -3123,9 +3178,9 @@ class Bot:
             sf = self.shot()
             more = self.v.find(sf, "more_settings_button", 0.9)
             if more:
-                n = settings_name(sf)  # the name, big and clean, beside the avatar - snapped to names already seen
-                near = n and difflib.get_close_matches(n.lower(), [x.lower() for x in self._names], 1, 0.75)
-                self._settings_name = next((x for x in self._names if near and x.lower() == near[0]), n)
+                n = settings_name(sf)  # the name, big and clean, beside the avatar: trusted as read (only the
+                self._settings_name = next((x for x in self._names if n and x.lower() == n.lower()), n)  # case
+                # follows a known name) - it's what corrects a slipped top-left read ('GecCol' -> 'GeoCol')
                 break
             self.sleep(0.5)
         data, hit = None, None
@@ -3182,8 +3237,14 @@ class Bot:
         tags = self.cfg.setdefault("account_tags", {})
         # 1) a tag seen before  2) the top-left name  3) the Settings window's name  4) the tag itself - a scan
         # never fails just because a name couldn't be read (a fancy name / font / layout on another PC)
-        acc = (tags.get(data["tag"]) or (self._last_name if self._last_name not in (None, "?") else None)
-               or getattr(self, "_settings_name", None) or data["tag"])
+        clean = getattr(self, "_settings_name", None)  # the Settings window's big, clean name
+        last = self._last_name if self._last_name not in (None, "?") else None
+        if not tags.get(data["tag"]) and clean and last and clean != last and self.same_game_name(clean, last):
+            if last in self._names:  # first time this account is seen: the top-left read slipped ('GecCol' for
+                self._names.remove(last)  # 'GeoCol') - file it under the clean name, and snap future reads to it
+            self._names.append(clean)
+            last = clean
+        acc = tags.get(data["tag"]) or last or clean or data["tag"]
         bases = export_items(data)
         if data["tag"] not in tags and acc in tags.values():
             # a new tag under a name another account already has (two accounts called 'GeoCol2'): never file it
