@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 51  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 52  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1331,6 +1331,7 @@ class Bot:
         self.hits = {}
         self._last_shot = self._last_preview = 0.0
         self._bank_backoff = {}
+        self._rescan_tried = {}  # (account, village) -> when a planner rescan was last attempted
         self._upgrade_backoff = {}
         self._busy_until = {}  # kind -> time: 'only the goblin is free' counts as busy for account rotation
         self._bb_next = {}     # account -> time of its next Builder Base visit
@@ -2186,7 +2187,7 @@ class Bot:
                     break
                 box = panel_box(frame)
                 if not box:  # not open (yet): never swipe then - it would drag the village (onto the boat...)
-                    if self.v.find(frame, "all_upgrades_complete", 0.85):  # a fully maxed village: no list at all
+                    if self.v.find(frame, "all_upgrades_complete", 0.75):  # a fully maxed village: no list at all
                         opened = True
                         break
                     self.sleep(0.6)
@@ -2981,7 +2982,7 @@ class Bot:
     # --- upgrade planner: per-account scans + targets ---
     def read_list(self):
         """Every row of the open builder / lab list, page by page: [(name, price, affordable)]."""
-        if self.v.find(self.shot(), "all_upgrades_complete", 0.85):
+        if self.v.find(self.shot(), "all_upgrades_complete", 0.75):
             self._maxed = True  # 'All Upgrades Complete' instead of a list
             return []
         seen, pages = {}, []
@@ -3303,8 +3304,10 @@ class Bot:
             age = time.time() - time.mktime(time.strptime(sd["time"], "%Y-%m-%d %H:%M"))
         except (KeyError, ValueError):
             age = 10 ** 9
-        if age < hours * 3600:
-            return False
+        tried = self._rescan_tried.get((self._last_name, base), 0)
+        if age < hours * 3600 or time.time() - tried < 3600:  # a scan that saved nothing (export blocked, nothing
+            return False                                       # left to list): don't retry it every loop
+        self._rescan_tried[(self._last_name, base)] = time.time()
         if self.scan_export():
             return True
         icon = top_bar(self.shot(), kind)[0]
