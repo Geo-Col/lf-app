@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 49  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 50  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -119,6 +119,7 @@ BUTTONS = [
     ("loading_logo", "Loading screen: Clash of Clans logo  - recovery"),
     ("loading_text", "Loading screen: 'Loading' bar text  - recovery"),
     ("popup_close", "A window's red X close button  - recovery"),
+    ("all_upgrades_complete", "'All Upgrades Complete' (maxed village)  - upgrades"),
     ("live_replay", "'Live Replay' (an attack on us, shown at login)  - recovery"),
     ("replay_return_home", "Return Home after that replay  - recovery"),
     ("chest_skip", "Chest event: the chest room's Skip  - events"),
@@ -2185,6 +2186,9 @@ class Bot:
                     break
                 box = panel_box(frame)
                 if not box:  # not open (yet): never swipe then - it would drag the village (onto the boat...)
+                    if self.v.find(frame, "all_upgrades_complete", 0.85):  # a fully maxed village: no list at all
+                        opened = True
+                        break
                     self.sleep(0.6)
                     continue
                 opened = True
@@ -2251,11 +2255,13 @@ class Bot:
         for attempt in range(3):  # a slid list can land the tap on the wrong building: just try again
             # always a fresh pick from the list: a bar left from the last purchase holds walls a level higher now
             more = self.select_wall(kind)
-            if more:
+            if more or self._no_wall_rows:  # no wall on the list at all: retrying won't help
                 break
             self.log(f"Wall upgrade: didn't get a wall selected (attempt {attempt + 1}/3) - retrying.")
         else:
             return self.wall_fail("couldn't select a wall", self.shot())
+        if not more:
+            return False  # every wall is max (the caller says so)
         f = self.shot()
         lab = f[more[1] + 10:more[1] + 50, more[0] - 70:more[0] + 70].astype(int) if more != "open" else None
         disabled = lab is not None and ((lab[:, :, 2] > 170) & (lab[:, :, 2] - lab[:, :, 1] > 70) & (lab[:, :, 2] - lab[:, :, 0] > 50)).mean() > 0.08
@@ -2827,7 +2833,13 @@ class Bot:
                                                    if goblin else "no free slot") + ". Checking again in 30 min.")
         if kind == "builder":
             self._saving_home = None
+        self._maxed = False
         seen = self.read_list()  # the whole list first: the discount and levels are worked out from all of it
+        if self._maxed:
+            self._upgrade_backoff[kind] = time.time() + 6 * 3600
+            self.back_to_village(icon)
+            return self.log(f"{KIND_NAMES[kind]}: All Upgrades Complete on this account - not looking again for 6 h.",
+                            "ok")
         plan, levels = self.plan_positions(kind, seen)
         other = None  # saving up for the plan's next target: the resource it does NOT need (spare builders use it)
         if plan:  # this account has a plan: stick to it - the next target in order, or wait (keep farming) for it
@@ -2969,6 +2981,9 @@ class Bot:
     # --- upgrade planner: per-account scans + targets ---
     def read_list(self):
         """Every row of the open builder / lab list, page by page: [(name, price, affordable)]."""
+        if self.v.find(self.shot(), "all_upgrades_complete", 0.85):
+            self._maxed = True  # 'All Upgrades Complete' instead of a list
+            return []
         seen, pages = {}, []
         for _ in range(8):
             frame = self.shot()
