@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 44  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 45  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1556,8 +1556,31 @@ class Bot:
         n = self._last_name
         return bool(n) and " (" not in n and n != getattr(self, "_tag_ok", None) and any(k.startswith(n + " (") for k in self.cfg.get("scans") or {})
 
+    def read_accounts(self):
+        """Open the Supercell ID list just to note the accounts on it (for the phone view's picker), then close it."""
+        self.back_to_village()
+        f = self.shot()
+        self.tap(self.find(f, "settings_cog_button") or (int(1842 * f.shape[1] / 1920), int(765 * f.shape[1] / 1920)), 2.0)
+        sw = self.wait_for("switch_account_button", 5)
+        if sw:
+            self.tap(sw, 2.5)
+            if self.wait_for("supercell_id_header", 6):
+                rows = self.all_accounts()
+                self.log(f"Accounts on this device: {', '.join(r['sc'] for r in rows)}.", "ok")
+        self.back_to_village()
+        if not self.at_village(self.shot()):  # the Supercell ID panel can need a couple of Backs
+            for _ in range(3):
+                self.adb.back()
+                self.sleep(1.2)
+                if self.at_village(self.shot()):
+                    break
+
     def phone_switch(self):
         """An account picked on the phone view: switch now (we're on a village). True if one was waiting."""
+        if getattr(self, "list_req", False):
+            self.list_req = False
+            self.read_accounts()
+            return True
         sc, self.switch_req = getattr(self, "switch_req", None), None
         if not sc:
             return False
@@ -3758,7 +3781,8 @@ $("m").onchange=()=>{if(RUN&&$("m").value!==MODE){confirm("Switch to "+$("m").se
 cmd({action:"start",mode:$("m").value}):($("m").value=MODE);}};
 $("pz").onchange=()=>{const v=$("pz").value;$("pz").value="";if(v&&confirm("Pause for "+v+" minutes?"))cmd({action:"pause",minutes:+v});};
 $("rg").onclick=()=>confirm("Restart Clash of Clans?")&&cmd({action:"restart_game"});
-$("sw").onclick=()=>{const a=$("acc").value;if(a&&confirm("Switch to "+a+"?"))cmd({action:"switch_account",account:a});};
+$("sw").onclick=()=>{const a=$("acc").value;if(!a)return cmd({action:"load_accounts"});
+if(confirm("Switch to "+a+"?"))cmd({action:"switch_account",account:a});};
 const STATS=[["runtime","Runtime"],["attacks","Attacks","king"],["walls","Walls","wall"],["upgrades","Upgrades","hammer"],
 ["switches","Switches","builder_icon"],["skipped","Skipped","shield"],["recoveries","Restarts"],["battery","Battery"]];
 async function tick(){try{const s=await (await fetch("status"+Q,{cache:"no-store"})).json();
@@ -3766,8 +3790,8 @@ const st=$("state");st.textContent=s.state;st.className="pill"+(/idle|stopped/i.
 $("mode").textContent=s.mode?"Mode: "+s.mode:"";
 if(s.modes&&!$("m").options.length)$("m").innerHTML=s.modes.map(([k,l])=>`<option value="${k}">${l}</option>`).join("");
 const A=s.accounts||[];if($("acc").options.length!==(A.length||1))$("acc").innerHTML=A.length?
-A.map(([k,l])=>`<option value="${k}">${l}</option>`).join(""):'<option value="">Accounts show after the first switch</option>';
-$("sw").disabled=!A.length;if(s.current_acc&&document.activeElement!==$("acc"))$("acc").value=s.current_acc;
+A.map(([k,l])=>`<option value="${k}">${l}</option>`).join(""):'<option value="">No accounts saved yet</option>';
+$("sw").textContent=A.length?"Switch account":"Load accounts";if(s.current_acc&&document.activeElement!==$("acc"))$("acc").value=s.current_acc;
 RUN=!!s.running;MODE=s.mode_key||"";if(document.activeElement!==$("m"))$("m").value=MODE;
 $("go").textContent=RUN?"Stop":"Start";$("go").className="go"+(RUN?" stop":"");
 if(s.resume_in>0)$("cmsg").textContent="Paused - starts again in "+Math.ceil(s.resume_in/60)+" min.";
@@ -3786,7 +3810,7 @@ $("f").src="frame.jpg"+Q+"&t="+Date.now();}catch(e){const st=$("state");st.textC
 tick();setInterval(tick,1500);</script></body></html>"""
 
 
-PHONE_ACTIONS = ("start", "stop", "pause", "restart_game", "switch_account")
+PHONE_ACTIONS = ("start", "stop", "pause", "restart_game", "switch_account", "load_accounts")
 
 
 class PhoneView:
@@ -3795,7 +3819,7 @@ class PhoneView:
     lock, so the link is as good as the controls."""
 
     def __init__(self, port, key, on_cmd=None):
-        self.jpeg, self.status = b"", {"state": "Idle", "log": []}
+        self.jpeg, self.status, self.last_seen = b"", {"state": "Idle", "log": []}, 0
         view = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -3823,6 +3847,7 @@ class PhoneView:
                 if f"k={key}" not in query.split("&"):
                     self.send_error(403, "Missing or wrong access key - use the full link shown in the app.")
                     return
+                view.last_seen = time.time()  # someone has the page open (the idle view only runs then)
                 if path == "/frame.jpg":
                     body, ctype = view.jpeg, "image/jpeg"
                 elif re.fullmatch(r"/ui/[a-z_]+\.png", path):  # the page's Clash icons (wiki/ui)
@@ -4904,6 +4929,8 @@ class App(tk.Tk):
         if warn:
             self.log(warn, "warn")
         self.bg(self._initial_connect)
+        if self.phone:
+            threading.Thread(target=self._idle_frames, daemon=True).start()
         if self.cfg.get("shortcuts_v") != APP_VERSION:  # after an update: shortcuts get the King icon
             def shortcuts():
                 if fix_shortcuts():
@@ -5582,6 +5609,18 @@ class App(tk.Tk):
             if k != mode:
                 card.config(highlightbackground=CARD)
 
+    def _idle_frames(self):
+        """While the bot is stopped (it sends its own frames when running) and someone has the phone view open:
+        a fresh game screenshot every 2 s, so the live view isn't blank."""
+        while True:
+            time.sleep(2)
+            if self.thread or time.time() - self.phone.last_seen > 20:
+                continue
+            try:
+                self.emit("frame", self.adb.screenshot())
+            except Exception:
+                time.sleep(8)  # emulator not up: don't hammer adb
+
     def phone_cmd(self, c):
         """A button on the live view: start (a mode) / stop / pause N minutes / restart the game."""
         a, mode = c.get("action"), c.get("mode") if c.get("mode") in MODES else self.mode_var.get()
@@ -5604,6 +5643,12 @@ class App(tk.Tk):
             self.log(f"📱 Phone: pause for {mins} min.", "ok")
             if running:
                 self.bot.stop_evt.set()
+        elif a == "load_accounts":
+            self.log("📱 Phone: reading the account list.", "ok")
+            if running:
+                self.bot.list_req = True  # at the next village screen
+            else:
+                self.bg(lambda: Bot(self.cfg, self.adb, self.emit, mode).read_accounts())
         elif a == "switch_account":
             sc = c.get("account")
             if sc not in [x["sc"] for x in self.cfg.get("sc_accounts") or []]:
