@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 61  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 62  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -87,6 +87,9 @@ BUNDLED = {"adb_path": os.path.join(BASE_DIR, "platform-tools", "adb.exe"),
            "tesseract_path": os.path.join(BASE_DIR, "Tesseract-OCR", "tesseract.exe")}
 os.makedirs(TEMPLATE_DIR, exist_ok=True)
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # no console flash per adb call
+# The bot's own adb server port: BlueStacks ships an older adb (HD-Adb.exe), and two adb versions on the usual port
+# 5037 kill each other's server over and over ('server version doesn't match this client') - endless disconnects.
+ADB_ENV = dict(os.environ, ANDROID_ADB_SERVER_PORT="5038")
 
 BUTTONS = [
     ("attack_button", "Attack! (home screen)"),
@@ -450,7 +453,8 @@ class ADB:
 
     def run(self, *a, timeout=15):
         try:
-            return subprocess.run(self._cmd(*a), capture_output=True, timeout=timeout, creationflags=NO_WINDOW)
+            return subprocess.run(self._cmd(*a), capture_output=True, timeout=timeout, creationflags=NO_WINDOW,
+                                  env=ADB_ENV)
         except FileNotFoundError:
             raise ADBError(f"adb.exe not found at '{self.path}'")
         except OSError as e:
@@ -461,7 +465,7 @@ class ADB:
     def host(self, *a, timeout=15):
         try:
             r = subprocess.run([self.path, *a], capture_output=True, text=True, timeout=timeout,
-                               creationflags=NO_WINDOW)
+                               creationflags=NO_WINDOW, env=ADB_ENV)
         except FileNotFoundError:
             raise ADBError(f"adb.exe not found at '{self.path}'")
         except OSError as e:
@@ -494,7 +498,7 @@ class ADB:
             if self._sh is None or self._sh.poll() is not None:
                 try:
                     self._sh = subprocess.Popen(self._cmd("shell"), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                                stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+                                                stderr=subprocess.STDOUT, creationflags=NO_WINDOW, env=ADB_ENV)
                 except OSError as e:
                     raise ADBError(f"couldn't start adb shell: {e}")
                 self._q = queue.Queue()
