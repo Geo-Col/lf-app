@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 62  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 63  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -544,12 +544,14 @@ class ADB:
         return r.stdout.decode(errors="replace")
 
     def screenshot(self):
-        img = decode_raw(self.run("exec-out", "screencap", timeout=20).stdout)  # slow while the emulator boots
+        r = self.run("exec-out", "screencap", timeout=20)  # slow while the emulator boots
+        img = decode_raw(r.stdout)
         if img is None:
-            png = self.run("exec-out", "screencap", "-p", timeout=10).stdout
-            img = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR) if png else None
-        if img is None:
-            raise ADBError("screenshot failed - is the emulator running?")
+            r = self.run("exec-out", "screencap", "-p", timeout=10)
+            img = cv2.imdecode(np.frombuffer(r.stdout, np.uint8), cv2.IMREAD_COLOR) if r.stdout else None
+        if img is None:  # adb's own reason ('device offline', "device '...' not found") says what to fix
+            why = r.stderr.decode(errors="replace").strip()[:120]
+            raise ADBError(f"screenshot failed ({why or 'no image'}) - is the emulator running?")
         return img
 
     def tap(self, x, y):
@@ -3705,13 +3707,10 @@ class Bot:
             self.sleep(min(600, 60 * self.game_relaunches))
 
     def reconnect(self):
-        target = self.cfg["auto_connect_target"]
-        if target:
-            self.log(f"adb connect {target}: {self.adb.connect(target)}")
-        devs = self.adb.devices()
-        if devs and self.adb.device not in devs:
-            self.adb.device = target if target in devs else devs[0]
-            self.emit("devices", devs)
+        devs, notes = find_device(self.adb, self.cfg)
+        for n in notes:
+            self.log(n)
+        self.emit("devices", devs)
         return self.adb.ready()
 
     def emulator_crashed(self):
@@ -4179,6 +4178,36 @@ def bs_conf_set(values):
         s = re.sub(rf'(bst\.instance\.[^.\n]+\.{key})="[^"]*"', rf'\1="{val}"', s)
     with open(BS_CONF, "w", encoding="utf-8", newline="") as f:
         f.write(s)
+
+
+def find_device(adb, cfg):
+    """Connect to the emulator and pick it: the configured address first, then the ADB ports BlueStacks itself
+    lists in bluestacks.conf (another instance / a non-default port). A fresh adb server takes ~2 s to list
+    emulators, so it waits a few s. Returns (devices, notes for the log)."""
+    targets = [cfg["auto_connect_target"]] if cfg["auto_connect_target"] else []
+    try:
+        conf = open(BS_CONF, encoding="utf-8").read()
+    except OSError:
+        conf = ""
+    targets += [f"127.0.0.1:{p}" for p in re.findall(r'status\.adb_port="(\d+)"', conf)]
+    targets = list(dict.fromkeys(targets))
+    notes = []
+    for t in targets:
+        if f"{t}\toffline" in adb.host("devices", timeout=10):  # a dead connection left over: drop it first
+            adb.host("disconnect", t, timeout=10)
+        out = adb.connect(t)
+        notes.append(f"adb connect {t}: {out}")
+        if out.startswith(("connected", "already connected")):
+            break
+    end = time.time() + 6
+    while not (devs := adb.devices()) and time.time() < end:
+        time.sleep(1)
+    if devs and adb.device not in devs:
+        adb.device = next((t for t in targets if t in devs), devs[0])
+    if not devs and 'enable_adb_access="0"' in conf:
+        notes.append("BlueStacks has ADB turned off: BlueStacks Settings > Advanced > Android Debug Bridge "
+                     "(ADB) > on, then press the reconnect button.")
+    return devs, notes
 
 
 def process_running(exe):
@@ -5630,13 +5659,9 @@ class App(tk.Tk):
 
     # --- device ---
     def _initial_connect(self):
-        devs = self.adb.devices()
-        target = self.cfg["auto_connect_target"]
-        if not devs and target:
-            self.log(f"adb connect {target}: {self.adb.connect(target)}")
-            devs = self.adb.devices()
-        if devs and self.adb.device not in devs:
-            self.adb.device = self.cfg["device"] if self.cfg["device"] in devs else devs[0]
+        devs, notes = find_device(self.adb, self.cfg)
+        for n in notes:
+            self.log(n, "warn" if not devs else "info")
         self.emit("devices", devs)
         self.emit("device", bool(devs) and self.adb.ready())
         self.log(f"Devices: {', '.join(devs) or 'none - is the emulator running with ADB enabled?'}",
