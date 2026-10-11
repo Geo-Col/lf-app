@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 52  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 53  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2089,6 +2089,9 @@ class Bot:
                 continue
             if time.time() < self._bank_backoff.get(cur, 0):
                 continue
+            sv = self._saving_home
+            if sv and sv[0] == self._last_name and sv[2] == cur and time.time() < sv[3] and self.mode != "walls":
+                continue  # the upgrade plan is saving this resource for its next target: walls don't spend it
             self.sleep(0.5)
             region = self.cfg["ocr_regions"].get(f"bank_{cur}_region") or (0, 0, 1, 1)
             again = white_number(self.shot(), region)
