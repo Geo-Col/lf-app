@@ -76,7 +76,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 66  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 67  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1449,6 +1449,8 @@ class Bot:
             self.sleep(poll)
 
     def detect(self, frame):
+        if self.find(frame, "reload_game"):  # 'Anyone there?' covers any screen (a dimmed button behind it still
+            return None                      # matches): the unknown-screen path reloads the game
         if self.find(frame, "wall_okay_button"):  # an Okay/Cancel dialog covers whatever screen is behind it
             return None
         for name, state in STATES:
@@ -2497,7 +2499,7 @@ class Bot:
                 self.sleep(0.9)
                 boat = self.find_any_zoom(self.shot(), "bb_boat", 0.85)
             if boat:
-                if boat[1] < 200 or boat[0] > 1500:  # under the resource bars: a tap there opens the bar's
+                if boat[1] < 200 or boat[0] > 1500 or boat[1] > 800:  # under the resource bars / by the bottom buttons: a tap there opens the bar's
                     # tooltip (which then hides the boat) - drag the map to bring the boat toward the middle
                     self.adb.swipe(960, 540, 960 + (960 - boat[0]) // 2, 540 + (540 - boat[1]) // 2, 600)
                     self.sleep(1.0)
@@ -4543,7 +4545,7 @@ GREEN, AMBER, RED, BLUE, GOLD, PINK = "#3ddc97", "#f2b84b", "#ff6b6b", "#5aa9ff"
 
 def mix(a, b, t):
     """Colour between a and b ('#rrggbb'), t 0..1."""
-    a, b = (int(a[i:i + 2], 16) for i in (1, 3, 5)), (int(b[i:i + 2], 16) for i in (1, 3, 5))
+    a, b = [int(a[i:i + 2], 16) for i in (1, 3, 5)], [int(b[i:i + 2], 16) for i in (1, 3, 5)]
     return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
 
 
@@ -4557,6 +4559,8 @@ def retheme(root):
     if im is not None:
         a = np.asarray(im).astype(np.float32)
         rgb = a[:, :, :3]
+        hsv0 = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2HSV)  # the accent, found before any tinting
+        blue = (hsv0[:, :, 0] >= 90) & (hsv0[:, :, 0] <= 115) & (hsv0[:, :, 1] > 70)  # #57c8ff, #2f60d8
         sat = rgb.max(axis=2) - rgb.min(axis=2)
         v = rgb.mean(axis=2)
         t = np.clip((v - 70) / 110, 0, 1)[:, :, None]  # dark greys tinted fully, light ones (ticks) kept
@@ -4564,7 +4568,6 @@ def retheme(root):
         rgb = np.where((sat < 20)[:, :, None], tint * (1 - t) + rgb * t, rgb)
         u8 = np.clip(rgb, 0, 255).astype(np.uint8)
         hsv = cv2.cvtColor(u8, cv2.COLOR_RGB2HSV)
-        blue = (hsv[:, :, 0] >= 90) & (hsv[:, :, 0] <= 115) & (hsv[:, :, 1] > 70)  # the accent: #57c8ff, #2f60d8
         hsv[:, :, 0] = np.where(blue, 20, hsv[:, :, 0])  # -> gold (OpenCV hue 20 = 40 degrees)
         hsv[:, :, 1] = np.where(blue, np.minimum(hsv[:, :, 1], 190), hsv[:, :, 1])
         u8 = np.where(blue[:, :, None], cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB), u8)
@@ -4580,11 +4583,26 @@ def retheme(root):
     ImageDraw.Draw(im).rounded_rectangle((0, 0, 40 * k - 1, 40 * k - 1), radius=12 * k, fill=CARD, outline=LINE,
                                          width=k)
     root._card_img = ImageTk.PhotoImage(im.resize((40, 40), Image.LANCZOS), master=root)
+    # the theme re-applies its base colours on every <<ThemeChanged>>: give it ours, so they stick
+    root.tk.eval(f"set ttk::theme::sv_dark::colors(-bg) {CARD}; set ttk::theme::sv_dark::colors(-selbg) {GOLD}; "
+                 f"set ttk::theme::sv_dark::colors(-selfg) #1b1405")
+    root.tk.eval("configure_colors")
     s = ttk.Style(root)
     s.element_create("LF.Card.field", "image", root._card_img, border=14, padding=4, sticky="nsew")
     s.layout("Card.TFrame", [("LF.Card.field", {"sticky": "nsew", "children": [
         ("Card.padding", {"expand": 1, "sticky": "nsew"})]})])
     s.configure(".", background=CARD, foreground=TEXT, selectbackground=GOLD, selectforeground="#1b1405")
+    s.configure("Flat.TFrame", background=CARD)
+    s.configure("BgMuted.TLabel", background=BG, foreground=MUTED)
+    for st in ("TLabel", "TCheckbutton", "Switch.TCheckbutton", "TRadiobutton", "Big.TLabel", "Muted.TLabel",
+               "CardTitle.TLabel", "Title.TLabel", "Sub.TLabel", "Res.TLabel", "CardValue.TLabel", "Pill.TLabel"):
+        s.configure(st, background=CARD)
+    im = Image.new("RGBA", (40 * k, 40 * k), (0, 0, 0, 0))
+    ImageDraw.Draw(im).rounded_rectangle((0, 0, 40 * k - 1, 40 * k - 1), radius=10 * k, fill=CARD2)
+    root._tile_img = ImageTk.PhotoImage(im.resize((40, 40), Image.LANCZOS), master=root)
+    s.element_create("LF.Tile.field", "image", root._tile_img, border=12, padding=2, sticky="nsew")
+    s.layout("Tile.TFrame", [("LF.Tile.field", {"sticky": "nsew", "children": [
+        ("Tile.padding", {"expand": 1, "sticky": "nsew"})]})])
     for st in ("TFrame", "TNotebook", "Bg.TLabel", "Bg.Switch.TCheckbutton", "Bg.TRadiobutton"):
         s.configure(st, background=BG)
     s.configure("Treeview", background=CARD, fieldbackground=CARD, foreground=TEXT)
@@ -4597,6 +4615,78 @@ UI_SCALE = 1.0  # set from the real DPI at startup so the layout isn't tiny on 1
 def S(*v):
     r = tuple(int(round(x * UI_SCALE)) for x in v)
     return r if len(r) > 1 else r[0]
+
+
+def fade(w, key, opt, to, ms=160, item=None):
+    """Animate a colour option (bg / fg / a canvas item's fill or outline) to `to` over `ms`. One animation per
+    (widget, key) at a time: a new one takes over from wherever the last one got to."""
+    jobs = w.__dict__.setdefault("_fades", {})
+    if key in jobs:
+        w.after_cancel(jobs.pop(key))
+    get = (lambda: w.itemcget(item, opt)) if item else (lambda: w.cget(opt))
+    put = (lambda c: w.itemconfigure(item, **{opt: c})) if item else (lambda c: w.config(**{opt: c}))
+    start = get() or to
+    if not start.startswith("#") or len(start) != 7:
+        return put(to)
+    steps = max(1, ms // 16)
+
+    def step(i=1):
+        put(mix(start, to, 1 - (1 - i / steps) ** 3))  # ease-out
+        if i < steps:
+            jobs[key] = w.after(16, step, i + 1)
+        else:
+            jobs.pop(key, None)
+    step()
+
+
+class Pill(tk.Canvas):
+    """A rounded button: optional icon + text, a smooth hover fade, and a gold ring when selected."""
+
+    def __init__(self, parent, text, command=None, icon=None, bg=BG, fill=CARD2, hover=CARD_HI, fg=TEXT,
+                 font=("Segoe UI", 9, "bold"), padx=10, pady=6, radius=10, ring=GOLD):
+        self.f = tkfont.Font(parent, font=font)
+        self.icon, self.padx, self.pady, self.radius, self.ring = icon, S(padx), S(pady), S(radius), ring
+        self.fill, self.hover, self.fg, self.command, self.selected, self.enabled = fill, hover, fg, command, False, True
+        super().__init__(parent, bg=bg, highlightthickness=0, cursor="hand2")
+        self.shape = self.create_polygon(0, 0, 0, 0, smooth=True, fill=fill, outline=fill, width=S(2))
+        self.img = self.create_image(0, 0, anchor="w", image=icon) if icon else None
+        self.txt = self.create_text(0, 0, anchor="w", text=text, fill=fg, font=self.f)
+        self.layout()
+        self.bind("<Enter>", lambda e: self.enabled and fade(self, "fill", "fill", self.hover, item=self.shape))
+        self.bind("<Leave>", lambda e: fade(self, "fill", "fill", self.fill, item=self.shape))
+        self.bind("<ButtonRelease-1>", lambda e: self.enabled and self.command and self.command())
+
+    def layout(self):
+        iw = self.icon.width() + S(7) if self.icon else 0
+        ih = self.icon.height() if self.icon else 0
+        w = self.padx * 2 + iw + self.f.measure(self.itemcget(self.txt, "text"))
+        h = self.pady * 2 + max(ih, self.f.metrics("linespace"))
+        self.config(width=w, height=h)
+        r, x1, y1 = self.radius, w - 1, h - 1
+        self.coords(self.shape, r, 1, x1 - r, 1, x1, 1, x1, r, x1, y1 - r, x1, y1, x1 - r, y1, r, y1, 1, y1, 1, y1 - r,
+                    1, r, 1, 1)
+        if self.img:
+            self.coords(self.img, self.padx, h // 2)
+        self.coords(self.txt, self.padx + iw, h // 2)
+
+    def set(self, text=None, fill=None, hover=None, fg=None, enabled=None):
+        if text is not None:
+            self.itemconfigure(self.txt, text=text)
+            self.layout()
+        if fill:
+            self.fill = fill
+            fade(self, "fill", "fill", fill, item=self.shape)
+        if hover:
+            self.hover = hover
+        if fg:
+            self.itemconfigure(self.txt, fill=fg)
+        if enabled is not None:
+            self.enabled = enabled
+            self.config(cursor="hand2" if enabled else "arrow")
+
+    def select(self, on):
+        self.selected = on
+        fade(self, "ring", "outline", self.ring if on else self.fill, ms=220, item=self.shape)
 
 
 
@@ -4767,7 +4857,7 @@ class PlannerTab(ttk.Frame):
         wrap.pack(fill="both", expand=True)
         cv = tk.Canvas(wrap, bg=CARD if width else BG, highlightthickness=0, **({"width": width} if width else {}))
         sb = ttk.Scrollbar(wrap, command=cv.yview)
-        inner = ttk.Frame(cv, style="Card.TFrame" if width else "TFrame")
+        inner = ttk.Frame(cv, style="Flat.TFrame" if width else "TFrame")
         inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
         win = cv.create_window(0, 0, anchor="nw", window=inner)
         cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
@@ -5297,14 +5387,19 @@ class App(tk.Tk):
         for page, label, icon in (("Dashboard", "Dashboard", "trophy"), ("Upgrade planner", "Upgrade planner", "builder"),
                                   ("Setup", "Setup", "hammer"), ("Settings", "Settings", "lab"),
                                   ("Log", "Activity log", "xp")):
-            row = tk.Frame(side, bg=SIDE, cursor="hand2", padx=S(12), pady=S(7))
+            row = tk.Frame(side, bg=SIDE, cursor="hand2", padx=S(0), pady=S(7))
             row.pack(fill="x", padx=S(8), pady=S(1))
+            mark = tk.Frame(row, bg=SIDE, width=S(3))
+            mark.pack(side="left", fill="y", padx=S(0, 9))
+            row._mark = mark
             ic = tk.Label(row, image=self.ui_icon(icon, S(26)), bg=SIDE, width=S(30))
             ic.pack(side="left")
             tx = tk.Label(row, text=label, bg=SIDE, fg=TEXT, font=("Segoe UI", 11), anchor="w")
             tx.pack(side="left", padx=S(10, 0))
             for w in (row, ic, tx):
                 w.bind("<Button-1>", lambda e, p=page: self.nb.select(self.tabs[p]))
+            row.bind("<Enter>", lambda e, p=page: self._nav_hover(p, True))
+            row.bind("<Leave>", lambda e, p=page: self._nav_hover(p, False))
             self.nav[page] = (row, ic, tx)
 
         foot = tk.Frame(side, bg=SIDE)
@@ -5344,13 +5439,9 @@ class App(tk.Tk):
         main.pack(side="left", fill="both", expand=True)
         top = ttk.Frame(main, padding=S(20, 16, 20, 4))
         top.pack(fill="x")
-        self.start_btn = tk.Label(top, text="▶  Start", bg=GOLD, fg="#1b1405", cursor="hand2",
-                                  font=(self._font, 13, "bold"), padx=S(24), pady=S(12))
-        self.start_btn.pack(side="right", fill="y", padx=S(16, 0))
-        self.start_btn.bind("<Button-1>", lambda e: self.start_btn.cget("state") != "disabled"
-                            and self.toggle(self.mode_var.get()))
-        self.start_btn.bind("<Enter>", lambda e: self.start_btn.config(bg="#ffd56b"))
-        self.start_btn.bind("<Leave>", lambda e: self.start_btn.config(bg=GOLD))
+        self.start_btn = Pill(top, "▶   Start", lambda: self.toggle(self.mode_var.get()), fill=GOLD, hover="#ffcf6e",
+                              fg="#1b1405", font=(self._font, 13, "bold"), padx=30, pady=14, radius=16)
+        self.start_btn.pack(side="right", anchor="n", padx=S(16, 0))
         modes = tk.Frame(top, bg=BG)
         modes.pack(side="left", fill="x", expand=True)
         self.mode_var = tk.StringVar(value=self.cfg.get("ui_mode") if self.cfg.get("ui_mode") in MODES else "farm")
@@ -5363,15 +5454,9 @@ class App(tk.Tk):
                      anchor="w").pack(side="left")
             for m in ms:
                 title, _, icon = MODES[m]
-                pill = tk.Frame(row, bg=CARD, cursor="hand2", padx=S(8), pady=S(4), highlightthickness=S(2),
-                                highlightbackground=CARD, highlightcolor=CARD)
-                pill.pack(side="left", padx=S(0, 5))
-                ic = tk.Label(pill, image=self.ui_icon(icon, S(20)), bg=CARD)
-                ic.pack(side="left")
-                tx = tk.Label(pill, text=title, bg=CARD, fg=TEXT, font=("Segoe UI", 9, "bold"))
-                tx.pack(side="left", padx=S(6, 0))
-                for w in (pill, ic, tx):
-                    w.bind("<Button-1>", lambda e, m=m: self.pick_mode(m))
+                pill = Pill(row, title, lambda m=m: self.pick_mode(m), icon=self.ui_icon(icon, S(20)), fill=CARD,
+                            hover=CARD_HI, padx=11, pady=5, radius=12)
+                pill.pack(side="left", padx=S(0, 6))
                 self.mode_cards[m] = pill
         self.mode_desc = tk.Label(modes, text="", bg=BG, fg=MUTED, font=("Segoe UI", 9), anchor="w")
         self.mode_desc.pack(fill="x", pady=S(6, 0))
@@ -5393,7 +5478,7 @@ class App(tk.Tk):
                 save_config(self.cfg)
                 self.log(on if v.get() else off, "ok")
             ttk.Checkbutton(self.opt_row, text=label, variable=v, command=flip,
-                            style="Switch.TCheckbutton").pack(side="left", padx=S(0, 18))
+                            style="Bg.Switch.TCheckbutton").pack(side="left", padx=S(0, 18))
         self.pick_mode(self.mode_var.get(), save=False)
 
         nb = self.nb = ttk.Notebook(main, style="Hidden.TNotebook")  # pages; the sidebar is the tab row
@@ -5409,19 +5494,25 @@ class App(tk.Tk):
         self._build_settings(tabs["Settings"])
         self._build_log(tabs["Log"])
 
+    def set_start(self, state):
+        """The big button: Start (gold) / Stop (red) / Stopping... (greyed, not clickable)."""
+        text, fill, hover, fg = {"start": ("▶   Start", GOLD, "#ffcf6e", "#1b1405"),
+                                 "stop": ("■   Stop", "#e5534b", "#f06a62", "#ffffff"),
+                                 "stopping": ("Stopping…", CARD_HI, CARD_HI, MUTED)}[state]
+        self.start_btn.set(text=text, fill=fill, hover=hover, fg=fg, enabled=state != "stopping")
+
     def pick_mode(self, m, save=True):
         if self.thread:  # can't change mode while running
             return
         self.mode_var.set(m)
         for k, card in self.mode_cards.items():
-            on = k == m
-            card.config(highlightbackground=GOLD if on else CARD, highlightcolor=GOLD if on else CARD)
+            card.select(k == m)
         self.mode_desc.config(text=f"{mode_name(m)}  —  {MODES[m][1]}")
         if m == "farm":
             self.opt_row.pack(fill="x", pady=S(6, 0))
         else:
             self.opt_row.pack_forget()
-        self.start_btn.config(text="▶  Start", bg=GOLD, state="normal")
+        self.set_start("start")
         if save and self.cfg.get("ui_mode") != m:
             self.cfg["ui_mode"] = m
             save_config(self.cfg)
@@ -5438,7 +5529,7 @@ class App(tk.Tk):
                                                 ("upgrades", "Upgrades", "hammer"), ("switches", "Switches", "builder_icon"),
                                                 ("recoveries", "Restarts", "battlemachine"), ("errors", "Errors", None)]):
             stats.columnconfigure(i, weight=1, uniform="s")
-            c = tk.Frame(stats, bg=CARD, padx=S(10), pady=S(8))
+            c = ttk.Frame(stats, style="Card.TFrame", padding=S(12, 9, 10, 9))
             c.grid(row=0, column=i, sticky="nsew", padx=S(0 if i == 0 else 6, 0))
             tk.Label(c, text=title.upper(), bg=CARD, fg=MUTED, font=("Segoe UI", 7, "bold")).pack(anchor="w")
             v = tk.Frame(c, bg=CARD)
@@ -5450,10 +5541,14 @@ class App(tk.Tk):
             self.stat_labels[key].pack(side="left")
 
         live = self.card(tab, "Live view", row=1, column=0, padx=S(0, 6))
-        top = ttk.Frame(live, style="Card.TFrame")
+        top = ttk.Frame(live, style="Flat.TFrame")
         top.pack(fill="x", pady=S(0, 8))
+        self.dot = tk.Canvas(top, width=S(14), height=S(14), bg=CARD, highlightthickness=0)
+        self.dot_id = self.dot.create_oval(S(2), S(2), S(12), S(12), fill=MUTED, width=0)
+        self.dot.pack(side="left", padx=S(0, 8))
         self.state_label = ttk.Label(top, text="Idle", style="Big.TLabel", foreground=MUTED)
         self.state_label.pack(side="left")
+        self._pulse()
         self.preview = tk.Canvas(live, bg=DEEP, highlightthickness=0, height=S(240))
         self.preview.pack(fill="both", expand=True)
         self.preview.create_text(10, 10, anchor="nw", text="The emulator screen appears here while farming.",
@@ -5484,7 +5579,7 @@ class App(tk.Tk):
         for i, (key, col, icon) in enumerate([("gold", GOLD, "gold"), ("elixir", PINK, "elixir"),
                                               ("dark", "#b9a3ff", "dark")]):
             rates.columnconfigure(i, weight=1, uniform="rt")
-            cell = self.rate_cells[key] = tk.Frame(rates, bg=CARD2, padx=S(8), pady=S(8))
+            cell = self.rate_cells[key] = ttk.Frame(rates, style="Tile.TFrame", padding=S(10, 8))
             cell.grid(row=0, column=i, sticky="nsew", padx=S(0 if i == 0 else 6, 0))
             self.rate_icons[key] = tk.Label(cell, image=self.ui_icon(icon, S(24)), bg=CARD2)
             self.rate_icons[key].pack(side="left", padx=S(0, 8))
@@ -5523,7 +5618,7 @@ class App(tk.Tk):
         bar = ttk.Frame(tab)
         bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=S(0, 10))
         ttk.Label(bar, text="Put the game on the right screen, select a row, then Capture.",
-                  style="Muted.TLabel").pack(side="left")
+                  style="BgMuted.TLabel").pack(side="left")
         ttk.Button(bar, text="Run setup check", style="Accent.TButton",
                    command=lambda: self.bg(self.setup_check)).pack(side="right")
         tools = ttk.Menubutton(bar, text="🧰  Tools")
@@ -5555,7 +5650,7 @@ class App(tk.Tk):
         c = self.card(lcol, "Buttons", row=0, column=0, pady=S(0, 12))
         self.btn_tree = self._tree(c, ("Button", "Status", "Match"), (250, 110, 70), len(BUTTONS))
         self.btn_tree.pack(fill="x")
-        row = ttk.Frame(c, style="Card.TFrame")
+        row = ttk.Frame(c, style="Flat.TFrame")
         row.pack(fill="x", pady=S(10, 0))
         ttk.Button(row, text="Capture", style="Accent.TButton", command=self.capture_button).pack(side="left")
         ttk.Button(row, text="Test match", command=self.test_button).pack(side="left", padx=S(8))
@@ -5563,7 +5658,7 @@ class App(tk.Tk):
         c = self.card(rcol, "Text regions (OCR)", row=0, column=0, pady=S(0, 12))
         self.ocr_tree = self._tree(c, ("Region", "Status", "Last read"), (210, 100, 110), len(OCR_REGIONS))
         self.ocr_tree.pack(fill="x")
-        row = ttk.Frame(c, style="Card.TFrame")
+        row = ttk.Frame(c, style="Flat.TFrame")
         row.pack(fill="x", pady=S(10, 0))
         ttk.Button(row, text="Capture", style="Accent.TButton", command=self.capture_region).pack(side="left")
         ttk.Button(row, text="Test read", command=self.test_region).pack(side="left", padx=S(8))
@@ -5600,7 +5695,7 @@ class App(tk.Tk):
         foot.pack(side="bottom", fill="x", pady=S(10, 0))
         ttk.Button(foot, text="Save settings", style="Accent.TButton", command=self.save_settings).pack(side="right")
         ttk.Button(foot, text="Discard changes", command=self.load_settings_vars).pack(side="right", padx=S(8))
-        ttk.Label(foot, text="Changes apply immediately, even while farming.", style="Muted.TLabel").pack(side="left")
+        ttk.Label(foot, text="Changes apply immediately, even while farming.", style="BgMuted.TLabel").pack(side="left")
         area = self._scroll_area(tab)
         area.columnconfigure(0, weight=1)
         self.svars = {}
@@ -5682,9 +5777,11 @@ class App(tk.Tk):
                 elif kind == "state":
                     col = RED if data == "Recovering" else MUTED if data in ("Stopped", "Idle") else GREEN
                     self.state_label.config(text=data, foreground=col)
+                    self._dot_col = col
                 elif kind == "stats":
                     for k, v in data.items():
-                        self.stat_labels[k].config(text=f"{v:,}")
+                        if k in self.stat_labels:
+                            self.count_to(self.stat_labels[k], v)
                 elif kind == "frame":
                     frame = data
                 elif kind == "device":
@@ -5757,7 +5854,6 @@ class App(tk.Tk):
         if self.thread and not self.thread.is_alive():
             self.thread = self.bot = None
             self.started_at = None
-            self.start_btn.config(state="normal")
             self.pick_mode(self.mode_var.get(), save=False)
         if self._resume and not self.thread and time.time() >= self._resume[0]:  # end of a phone pause / switch
             mode, self._resume = self._resume[1], None
@@ -5787,9 +5883,17 @@ class App(tk.Tk):
         s = min(cw / w, ch / h)
         img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).resize(
             (max(1, int(w * s)), max(1, int(h * s))), Image.BILINEAR)
-        self._photo = ImageTk.PhotoImage(img)
-        self.preview.delete("all")
-        self.preview.create_image(cw // 2, ch // 2, image=self._photo)
+        prev, self._prev_img = getattr(self, "_prev_img", None), img
+        if getattr(self, "_xfade", None):
+            self.after_cancel(self._xfade)
+
+        def show(i=1, n=4):  # a quick crossfade from the last frame (same size only)
+            pic = Image.blend(prev, img, i / n) if prev is not None and prev.size == img.size and i < n else img
+            self._photo = ImageTk.PhotoImage(pic)
+            self.preview.delete("all")
+            self.preview.create_image(cw // 2, ch // 2, image=self._photo)
+            self._xfade = self.after(40, show, i + 1) if i < n and prev is not None and prev.size == img.size else None
+        show()
 
     def _copy(self, text, what):
         self.clipboard_clear()
@@ -5862,7 +5966,7 @@ class App(tk.Tk):
         self._resume = None  # the PC's own Start / Stop overrides a pause set from the phone
         if self.thread:
             self.bot.stop_evt.set()
-            self.start_btn.config(text="Stopping…", state="disabled")
+            self.set_start("stopping")
             return
         miss = self.missing_setup()
         if miss:
@@ -5895,10 +5999,9 @@ class App(tk.Tk):
         if self.public_url:  # the start-up post can be missed (PC asleep, network not up yet): send it again
             url = self.public_url
             self.announce(f"▶️ Farming started on **{os.environ.get('COMPUTERNAME', 'a PC')}**\n{url}")
-        self.start_btn.config(text="■  Stop")
+        self.set_start("stop")
         for k, card in self.mode_cards.items():
-            if k != mode:
-                card.config(highlightbackground=CARD)
+            card.select(k == mode)
 
     def _idle_frames(self):
         """While the bot is stopped (it sends its own frames when running) and someone has the phone view open:
@@ -5981,7 +6084,7 @@ class App(tk.Tk):
             lbl.config(image=self.ui_icon(self.res_icon(k), S(32)))
         self.res_card_title.config(text="BUILDER BASE STORAGE" if bb else "YOUR STORAGE")
         for k, lbl in self.rate_icons.items():
-            lbl.config(image=self.ui_icon(self.res_icon(k), S(30)))
+            lbl.config(image=self.ui_icon(self.res_icon(k), S(24)))
         self.rate_cells["dark"].master.columnconfigure(2, weight=0 if bb else 1, uniform="" if bb else "rt")
         self.rate_cells["dark"].grid_remove() if bb else self.rate_cells["dark"].grid()
         self.render_loot()
@@ -6131,14 +6234,46 @@ class App(tk.Tk):
             self.ui(lambda: self.after(800, self._restart_now))
         self.bg(work)
 
+    def _nav_hover(self, page, on):
+        if self.tabs[page] is self.nb.nametowidget(self.nb.select()):
+            return
+        for w in self.nav[page]:
+            fade(w, "bg", "bg", "#141823" if on else SIDE, ms=120)
+
+    def _pulse(self, t=0):
+        """The live view's status dot breathes while farming; still and grey when idle."""
+        col = getattr(self, "_dot_col", MUTED)
+        if col == MUTED:
+            self.dot.itemconfigure(self.dot_id, fill=MUTED)
+        else:
+            self.dot.itemconfigure(self.dot_id, fill=mix(CARD, col, 0.45 + 0.55 * (0.5 + 0.5 * np.sin(t / 6))))
+        self.after(50, self._pulse, t + 1)
+
+    def count_to(self, lbl, v):
+        """A stat changes: its number counts up to the new value (ease-out, ~0.4 s)."""
+        try:
+            old = int(str(lbl.cget("text")).replace(",", ""))
+        except ValueError:
+            old = v
+        if old == v or not isinstance(v, int):
+            return lbl.config(text=f"{v:,}" if isinstance(v, int) else v)
+        if getattr(lbl, "_count", None):
+            lbl.after_cancel(lbl._count)
+
+        def step(i=1, n=12):
+            lbl.config(text=f"{round(old + (v - old) * (1 - (1 - i / n) ** 3)):,}")
+            lbl._count = lbl.after(30, step, i + 1) if i < n else None
+        step()
+
     def _tab_changed(self, _e=None):
         """The planner tab is built the first time it's opened (50+ cards: no need to slow the start-up)."""
         tab = self.nb.nametowidget(self.nb.select())
         for page, ws in self.nav.items():
             on = self.tabs[page] is tab
             for w in ws:
-                w.config(bg=NAV_ON if on else SIDE)
-            ws[2].config(font=("Segoe UI", 11, "bold" if on else "normal"))
+                fade(w, "bg", "bg", NAV_ON if on else SIDE)
+            fade(ws[0]._mark, "bg", "bg", GOLD if on else SIDE, ms=240)
+            ws[2].config(font=("Segoe UI", 11, "bold" if on else "normal"), fg=TEXT if on else "#b8bfce")
         if tab is self.planner_tab:
             if self.planner is None:
                 self.planner = PlannerTab(self, tab)
