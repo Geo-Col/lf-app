@@ -76,7 +76,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 70  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 71  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -3539,7 +3539,10 @@ class Bot:
             while y < H and col[y] >= 250:
                 y += 1
             bot = y
-            if bot - top < 60 * k:  # too little of the card showing to read its name
+            # a whole card, or one cut off by the bottom edge with its name line showing. One cut off at the top
+            # (sliding under the header) would have its lower lines read as the name - every swipe overlaps the
+            # last, so it was read whole on the screen before
+            if bot - top < 110 * k and not (bot >= H - 1 and bot - top >= 60 * k):
                 continue
             avatar = g[top:bot, int(1365 * k):int(1450 * k)]
             if avatar.size == 0 or avatar.mean() > 235:  # no avatar: the 'SWITCH ID' header, not an account
@@ -3564,13 +3567,21 @@ class Bot:
     def all_accounts(self):
         """Every account on the Supercell ID panel, top to bottom, scrolling down for long lists (10+ accounts).
         Returns (rows, the panel's last view)."""
+        k = self.shot().shape[1] / 1920
+        for _ in range(25):  # from the very top: the panel can open where it was last scrolled to
+            self.adb.swipe(int(1620 * k), int(600 * k), int(1620 * k), int(1000 * k), 300)
+        self.sleep(1.0)
         seen, frame = {}, self.shot()
-        k = frame.shape[1] / 1920
         self._list_end = False
-        for _ in range(20):  # ~2.5 accounts per swipe: room for 40+
-            new = [r for r in self.list_accounts(frame) if r["sc"] not in seen]
+        for _ in range(40):  # ~2.5 accounts per swipe: room for 100 (stops at the end of the list)
+            key = lambda r: re.sub(r"\W", "", r["sc"].lower())  # the same card read on two screens
+            rows = self.list_accounts(frame)
+            for r in rows:  # first seen cut off at the bottom: its Town Hall line comes with a later, whole read
+                if key(r) in seen and seen[key(r)]["th"] is None and r["th"] is not None:
+                    seen[key(r)]["th"] = r["th"]
+            new = [r for r in rows if key(r) not in seen]
             for r in new:
-                seen[r["sc"]] = r
+                seen[key(r)] = r
             if not new or self._list_end:
                 break
             self.adb.swipe(int(1620 * k), int(960 * k), int(1620 * k), int(620 * k), 700)  # inside the panel
@@ -3578,7 +3589,7 @@ class Bot:
             frame = self.shot()
         known = [{"sc": r["sc"], "game": r["game"], "th": r["th"]} for r in seen.values()]
         if known and not self._list_end:  # didn't get to the bottom: keep accounts saved before that weren't seen
-            known += [a for a in self.cfg.get("sc_accounts") or [] if a.get("sc") not in seen]
+            known += [a for a in self.cfg.get("sc_accounts") or [] if re.sub(r"\W", "", (a.get("sc") or "").lower()) not in seen]
         if known and known != self.cfg.get("sc_accounts"):  # for the phone view's account picker
             self.cfg["sc_accounts"] = known
             save_config(self.cfg)
@@ -3589,10 +3600,10 @@ class Bot:
         f = self.shot()
         k = f.shape[1] / 1920
         if not any(re.sub(r"\W", "", r["sc"].lower()) == re.sub(r"\W", "", sc.lower()) for r in self.list_accounts(f)):  # not on screen: back to the top first
-            for _ in range(12):  # back to the top of a long list
+            for _ in range(25):  # back to the top of a long list
                 self.adb.swipe(int(1620 * k), int(600 * k), int(1620 * k), int(1000 * k), 300)
             self.sleep(1.0)
-        for _ in range(20):
+        for _ in range(40):
             same = lambda a, b: re.sub(r"\W", "", a.lower()) == re.sub(r"\W", "", b.lower())  # OCR case / spacing
             row = next((r for r in self.list_accounts(self.shot()) if same(r["sc"], sc)), None)
             if row:
@@ -3977,7 +3988,7 @@ h2{font-size:12px;color:#9a9a9a;text-transform:uppercase;letter-spacing:.05em;ma
 .wall .m{color:#9a9a9a;font-size:12px}
 .ctl{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
 .ctl select,.ctl button{font:inherit;font-size:14px;border:0;border-radius:10px;padding:10px 12px;background:#2a2f3a;color:#e9e9ec}
-.ctl select{flex:1 1 140px}.ctl .go{background:#f5c542;color:#1b1405;font-weight:800;min-width:96px}
+.ctl select{flex:1 1 140px}.ctl #accq{flex:1 1 100%;font:inherit;font-size:14px;border:0;border-radius:10px;padding:10px 12px;background:#2a2f3a;color:#e9e9ec}.ctl .go{background:#f5c542;color:#1b1405;font-weight:800;min-width:96px}
 .ctl .go.stop{background:#a33a3a;color:#fff}
 .opts{display:flex;flex-wrap:wrap;gap:6px 16px;flex-basis:100%;font-size:14px}.opts label{display:flex;align-items:center;gap:6px}
 .opts input{width:18px;height:18px;accent-color:#f5c542}
@@ -3994,7 +4005,7 @@ max-height:260px;overflow:auto}
 <label><input type="checkbox" id="o_builder_base_enabled">Visit the Builder Base</label></div>
 <select id="pz"><option value="">Pause&hellip;</option><option value="15">15 min</option><option value="30">30 min</option>
 <option value="60">1 hour</option><option value="120">2 hours</option></select><button id="rg">Restart game</button>
-<select id="acc"></select><button id="sw">Switch account</button><button id="rs" title="Read the account list again (new accounts)">&#8635; Rescan accounts</button>
+<input id="accq" type="search" placeholder="Search accounts" autocomplete="off"><select id="acc"></select><button id="sw">Switch account</button><button id="rs" title="Read the account list again (new accounts)">&#8635; Rescan accounts</button>
 <div id="cmsg"></div></div>
 <div class="row r3" id="rates"></div>
 <div class="row r2" id="store"></div>
@@ -4014,6 +4025,12 @@ $("m").onchange=()=>{$("opts").style.display=$("m").value==="farm"?"flex":"none"
 cmd({action:"start",mode:$("m").value}):($("m").value=MODE);}};
 $("pz").onchange=()=>{const v=$("pz").value;$("pz").value="";if(v&&confirm("Pause for "+v+" minutes?"))cmd({action:"pause",minutes:+v});};
 $("rg").onclick=()=>confirm("Restart Clash of Clans?")&&cmd({action:"restart_game"});
+let ACCS=[];const esc=t=>t.replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function fillAcc(){const q=$("accq").value.trim().toLowerCase(),keep=$("acc").value,
+L=ACCS.filter(([k,l])=>!q||l.toLowerCase().includes(q));$("accq").placeholder="Search "+ACCS.length+" account"+(ACCS.length==1?"":"s");
+$("acc").innerHTML=L.length?L.map(([k,l])=>`<option value="${esc(k)}">${esc(l)}</option>`).join(""):
+`<option value="">${ACCS.length?"No match":"No accounts saved yet"}</option>`;if(L.some(([k])=>k===keep))$("acc").value=keep;}
+$("accq").oninput=fillAcc;
 $("rs").onclick=()=>confirm("Read the account list from the game again?")&&cmd({action:"load_accounts"});
 $("sw").onclick=()=>{const a=$("acc").value;if(!a)return cmd({action:"load_accounts"});
 if(confirm("Switch to "+a+"?"))cmd({action:"switch_account",account:a});};
@@ -4026,16 +4043,15 @@ $("mode").textContent=s.mode?"Mode: "+s.mode:"";
 if(s.modes&&!$("m").options.length)$("m").innerHTML=s.modes.map(([v,ms])=>`<optgroup label="${v}">`+
 ms.map(([k,l])=>`<option value="${k}">${l}</option>`).join("")+"</optgroup>").join("");
 const O=s.options||{};for(const k in O)if(document.activeElement!==$("o_"+k))$("o_"+k).checked=O[k];
-const A=s.accounts||[],AK=JSON.stringify(A);if($("acc").dataset.k!==AK){$("acc").dataset.k=AK;$("acc").innerHTML=A.length?
-A.map(([k,l])=>`<option value="${k}">${l}</option>`).join(""):'<option value="">No accounts saved yet</option>';}
-$("sw").textContent=A.length?"Switch account":"Load accounts";if(s.current_acc&&document.activeElement!==$("acc"))$("acc").value=s.current_acc;
+const A=s.accounts||[],AK=JSON.stringify(A);if($("acc").dataset.k!==AK){$("acc").dataset.k=AK;ACCS=A;fillAcc();}
+$("sw").textContent=A.length?"Switch account":"Load accounts";if(s.current_acc&&$("acc").dataset.cur!==s.current_acc&&!$("accq").value){$("acc").dataset.cur=s.current_acc;$("acc").value=s.current_acc;}
 RUN=!!s.running;MODE=s.mode_key||"";if(document.activeElement!==$("m"))$("m").value=MODE;
 $("opts").style.display=$("m").value==="farm"?"flex":"none";
 $("go").textContent=RUN?"Stop":"Start";$("go").className="go"+(RUN?" stop":"");
 if(s.resume_in>0)$("cmsg").textContent="Paused - starts again in "+Math.ceil(s.resume_in/60)+" min.";
 const B=s.bb,I=k=>B&&k!="dark"?"b"+k:k;$("rates").className="row "+(B?"r2":"r3");
 const R=s.rates||{};$("rates").innerHTML=[["gold","gold"],["elixir","elixir"]].concat(B?[]:[["dark","dark"]]).map(([k,c])=>
-`<div class="c"><img src="${ic(I(k))}"><div style="min-width:0"><div class="v ${c}">${((R[k]||["—"])[0]).replace(" / h","").replace(/(\\.\\d)\\dM/,"$1M")}</div><div class="l">per hour</div><div class="l" style="text-transform:none">${((R[k]||["",""])[1])}</div></div></div>`).join("");
+`<div class="c"><img src="${ic(I(k))}"><div style="min-width:0"><div class="v ${c}">${((R[k]||["—"])[0]).replace(" / h","").replace(/(\\.\\d)\\dM/,"$1M")}</div><div class="l">per hour</div><div class="l" style="text-transform:none">${((R[k]||["",""])[1]).replace(/^per hour$/,"")}</div></div></div>`).join("");
 $("store").innerHTML=[["s_gold","gold","gold"],["s_elixir","elixir","elixir"]].map(([k,i,c])=>
 `<div class="c"><img src="${ic(I(i))}"><div class="v ${c}">${s[k]??"—"}</div></div>`).join("");
 $("g").innerHTML=STATS.map(([k,l,i])=>`<div class="c s"><div class="l">${i?`<img src="${ic(i)}" style="height:14px;vertical-align:-2px"> `:""}${l}</div><div class="v">${s[k]??"-"}</div></div>`).join("");
