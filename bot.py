@@ -76,7 +76,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 67  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 68  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -3493,7 +3493,13 @@ class Bot:
 
     def list_accounts(self, frame):
         """Rows of the Supercell ID panel on screen: [{'sc': Supercell ID name, 'game': in-game name (rough OCR),
-        'th': Town Hall, 'xy': where to tap}] - a row is the bold name with a 'Town Hall: N' line under it."""
+        'th': Town Hall, 'xy': where to tap}]. Each account is a white card (avatar, name, in-game name,
+        'Town Hall: N'): the cards are found by their edges and each card's lines read on their own - whole
+        names, spaces and all ('Main Acc' / 'Main Alt' stay two accounts)."""
+        rows = self.account_cards(frame)
+        if rows is not None:
+            return rows
+        # not the card layout (an older / different panel): the word search below
         x0 = frame.shape[1] * 2 // 3
         try:
             d = pytesseract.image_to_data(cv2.cvtColor(frame[:, x0:], cv2.COLOR_BGR2GRAY), config="--psm 11",
@@ -3515,12 +3521,53 @@ class Bot:
                          "xy": (name[1], name[2])})
         return rows
 
+    def account_cards(self, frame):
+        """The card reader for list_accounts(); None if no cards are found (then its word search is used)."""
+        k = frame.shape[1] / 1920
+        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        col = g[:, int(1700 * k)].astype(int)  # cards are pure white, the gaps between them light grey
+        H, rows, y, prev_bot = len(col), [], int(380 * k), None
+        self._list_end = False
+        while y < H:
+            if col[y] < 250:
+                y += 1
+                continue
+            top = y
+            if prev_bot is not None and top - prev_bot > 50 * k:  # the 'OTHER IDS' divider: the accounts end here
+                self._list_end = True                              # ('Log in to Supercell ID' is below it)
+                break
+            while y < H and col[y] >= 250:
+                y += 1
+            bot = y
+            if bot - top < 60 * k:  # too little of the card showing to read its name
+                continue
+            avatar = g[top:bot, int(1365 * k):int(1450 * k)]
+            if avatar.size == 0 or avatar.mean() > 235:  # no avatar: the 'SWITCH ID' header, not an account
+                continue
+            prev_bot = bot
+            line = lambda a, b, x0, cfg: (pytesseract.image_to_string(cv2.resize(
+                g[top + int(a * k):min(H, top + int(b * k)), int(x0 * k):int(1790 * k)], None, fx=2, fy=2,
+                interpolation=cv2.INTER_CUBIC), config=cfg, timeout=5).strip() if top + int(a * k) < H else "")
+            try:
+                name = line(16, 54, 1458, "--psm 7")
+                game = line(46, 78, 1498, "--psm 7")
+                th = re.search(r"(\d{1,2})\s*$", line(76, 106, 1458, "--psm 7"))
+            except Exception:
+                continue
+            name = re.sub(r"\s+", " ", name).strip(" |_-.,'\"")
+            if len(name) < 2:
+                continue
+            rows.append({"sc": name, "game": game, "th": int(th.group(1)) if th and int(th.group(1)) <= 20 else None,
+                         "xy": (int(1520 * k), top + int(35 * k))})
+        return rows or None
+
     def all_accounts(self):
         """Every account on the Supercell ID panel, top to bottom, scrolling down for long lists (10+ accounts).
         Returns (rows, the panel's last view)."""
         seen, frame = {}, self.shot()
         k = frame.shape[1] / 1920
-        for _ in range(8):
+        self._list_end = False
+        for _ in range(20):  # ~2.5 accounts per swipe: room for 40+
             new = [r for r in self.list_accounts(frame) if r["sc"] not in seen]
             for r in new:
                 seen[r["sc"]] = r
@@ -3530,6 +3577,8 @@ class Bot:
             self.sleep(1.2)
             frame = self.shot()
         known = [{"sc": r["sc"], "game": r["game"], "th": r["th"]} for r in seen.values()]
+        if known and not self._list_end:  # didn't get to the bottom: keep accounts saved before that weren't seen
+            known += [a for a in self.cfg.get("sc_accounts") or [] if a.get("sc") not in seen]
         if known and known != self.cfg.get("sc_accounts"):  # for the phone view's account picker
             self.cfg["sc_accounts"] = known
             save_config(self.cfg)
@@ -3539,12 +3588,13 @@ class Bot:
         """Scroll the Supercell ID panel back to the top, then down until that account is on screen; tap it."""
         f = self.shot()
         k = f.shape[1] / 1920
-        if not any(r["sc"] == sc for r in self.list_accounts(f)):  # not on screen: back to the top first
-            for _ in range(4):
-                self.adb.swipe(int(1620 * k), int(600 * k), int(1620 * k), int(1000 * k), 400)
+        if not any(re.sub(r"\W", "", r["sc"].lower()) == re.sub(r"\W", "", sc.lower()) for r in self.list_accounts(f)):  # not on screen: back to the top first
+            for _ in range(12):  # back to the top of a long list
+                self.adb.swipe(int(1620 * k), int(600 * k), int(1620 * k), int(1000 * k), 300)
             self.sleep(1.0)
-        for _ in range(8):
-            row = next((r for r in self.list_accounts(self.shot()) if r["sc"] == sc), None)
+        for _ in range(20):
+            same = lambda a, b: re.sub(r"\W", "", a.lower()) == re.sub(r"\W", "", b.lower())  # OCR case / spacing
+            row = next((r for r in self.list_accounts(self.shot()) if same(r["sc"], sc)), None)
             if row:
                 self.tap(row["xy"], 4.0)
                 return True
@@ -3944,7 +3994,7 @@ max-height:260px;overflow:auto}
 <label><input type="checkbox" id="o_builder_base_enabled">Visit the Builder Base</label></div>
 <select id="pz"><option value="">Pause&hellip;</option><option value="15">15 min</option><option value="30">30 min</option>
 <option value="60">1 hour</option><option value="120">2 hours</option></select><button id="rg">Restart game</button>
-<select id="acc"></select><button id="sw">Switch account</button>
+<select id="acc"></select><button id="sw">Switch account</button><button id="rs" title="Read the account list again (new accounts)">&#8635; Rescan accounts</button>
 <div id="cmsg"></div></div>
 <div class="row r3" id="rates"></div>
 <div class="row r2" id="store"></div>
@@ -3964,6 +4014,7 @@ $("m").onchange=()=>{$("opts").style.display=$("m").value==="farm"?"flex":"none"
 cmd({action:"start",mode:$("m").value}):($("m").value=MODE);}};
 $("pz").onchange=()=>{const v=$("pz").value;$("pz").value="";if(v&&confirm("Pause for "+v+" minutes?"))cmd({action:"pause",minutes:+v});};
 $("rg").onclick=()=>confirm("Restart Clash of Clans?")&&cmd({action:"restart_game"});
+$("rs").onclick=()=>confirm("Read the account list from the game again?")&&cmd({action:"load_accounts"});
 $("sw").onclick=()=>{const a=$("acc").value;if(!a)return cmd({action:"load_accounts"});
 if(confirm("Switch to "+a+"?"))cmd({action:"switch_account",account:a});};
 const STATS=[["runtime","Runtime"],["attacks","Attacks","king"],["walls","Walls","wall"],["upgrades","Upgrades","hammer"],
@@ -3975,8 +4026,8 @@ $("mode").textContent=s.mode?"Mode: "+s.mode:"";
 if(s.modes&&!$("m").options.length)$("m").innerHTML=s.modes.map(([v,ms])=>`<optgroup label="${v}">`+
 ms.map(([k,l])=>`<option value="${k}">${l}</option>`).join("")+"</optgroup>").join("");
 const O=s.options||{};for(const k in O)if(document.activeElement!==$("o_"+k))$("o_"+k).checked=O[k];
-const A=s.accounts||[];if($("acc").options.length!==(A.length||1))$("acc").innerHTML=A.length?
-A.map(([k,l])=>`<option value="${k}">${l}</option>`).join(""):'<option value="">No accounts saved yet</option>';
+const A=s.accounts||[],AK=JSON.stringify(A);if($("acc").dataset.k!==AK){$("acc").dataset.k=AK;$("acc").innerHTML=A.length?
+A.map(([k,l])=>`<option value="${k}">${l}</option>`).join(""):'<option value="">No accounts saved yet</option>';}
 $("sw").textContent=A.length?"Switch account":"Load accounts";if(s.current_acc&&document.activeElement!==$("acc"))$("acc").value=s.current_acc;
 RUN=!!s.running;MODE=s.mode_key||"";if(document.activeElement!==$("m"))$("m").value=MODE;
 $("opts").style.display=$("m").value==="farm"?"flex":"none";
