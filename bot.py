@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 63  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 64  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -105,7 +105,6 @@ BUTTONS = [
     ("wall_okay_button", "Upgrade Walls dialog: Okay  - walls"),
     ("confirm_wall_upgrade_button", "Upgrade window: green Confirm  - upgrades"),
     ("building_upgrade_button", "Selected building's Upgrade button  - upgrades"),
-    ("settings_cog_button", "Settings cog (home)  - accounts"),
     ("switch_account_button", "Blue switch-account button  - accounts"),
     ("supercell_id_header", "Supercell ID panel logo  - accounts"),
     ("lab_picker_title", "Lab 'Choose what to upgrade' title  - upgrades"),
@@ -206,6 +205,7 @@ DEFAULTS = {
     "builder_upgrades_enabled": False,
     "skip_town_hall": True,
     "lab_upgrades_enabled": False,
+    "pets_upgrades_enabled": False,
     "builder_base_enabled": False,  # visit the Builder Base on every account: collect, cart, upgrades, daily stars
     "bb_visit_hours": 3,
     "bb_attacks_enabled": True,
@@ -277,6 +277,7 @@ SETTINGS = [
         ("builder_upgrades_enabled", "Builders: upgrade buildings / heroes", bool),
         ("skip_town_hall", "Never upgrade the Town Hall (don't rush)", bool),
         ("lab_upgrades_enabled", "Lab: research troops / spells", bool),
+        ("pets_upgrades_enabled", "Pet House: upgrade pets", bool),
         ("bank_spend_enabled", "Buy walls when storage is full", bool),
         ("bank_spend_threshold", "Spend when storage >=", int),
         ("bank_scroll_duration_ms", "List swipe duration (ms)", int),
@@ -329,7 +330,11 @@ SETTINGS = [
     ]),
 ]
 
-RUNTIME_KEYS = ("scans", "plans", "account_tags", "_last_account_idx", "loot_rate", "line_view", "ui_mode",
+# 1920x1080 boxes of the redesigned UI (Oct 2026): storage bars top-right, available loot top-left while scouting
+NEW_UI_REGIONS = {"bank_gold_region": [1446, 22, 1924, 95], "bank_elixir_region": [1508, 98, 1907, 165],
+                  "bank_dark_region": [1610, 170, 1840, 235], "loot_gold_region": [81, 135, 405, 180],
+                  "loot_elixir_region": [81, 186, 405, 232]}
+RUNTIME_KEYS = ("ui_v", "scans", "plans", "account_tags", "_last_account_idx", "loot_rate", "line_view", "ui_mode",
                 "sc_of_tag", "shortcuts_v", "sc_accounts")  # saved by the bot, not settings
 # Rarely-touched tuning: shown under 'Show advanced settings'
 ADVANCED = {"loot_settle_delay", "loot_recheck_delay", "loot_max_plausible", "hold_deploy", "damage_confirm_count",
@@ -362,6 +367,9 @@ def load_config():
         cfg[k] = {a: v for a, v in (cfg.get(k) or {}).items() if a not in ("", "?") and not misread(a)}
     for k in ("coords", "ocr_regions", "fixed_points"):
         cfg[k] = cfg.get(k) or {}
+    if cfg.get("ui_v", 0) < 2:  # Clash's October 2026 redesign moved the numbers: these boxes are the same for everyone
+        cfg["ocr_regions"].update(NEW_UI_REGIONS)
+        cfg["ui_v"] = 2
     for k, path in BUNDLED.items():
         if not (cfg.get(k) and os.path.exists(cfg[k])) and os.path.exists(path):
             cfg[k] = path
@@ -801,52 +809,74 @@ def white_number(frame, bbox):
     if c is None:
         return None
     hsv = cv2.cvtColor(c, cv2.COLOR_BGR2HSV)
-    return read_digit_blobs((hsv[:, :, 2] > hsv[:, :, 2].max() * 0.8) & (hsv[:, :, 1] < 70))
+    v = read_digit_blobs((hsv[:, :, 2] > hsv[:, :, 2].max() * 0.8) & (hsv[:, :, 1] < 70))
+    if v is None:  # a bar's pale fill behind the digits (a fuller storage) merges with them: only near-pure white
+        v = read_digit_blobs((hsv[:, :, 2] > 235) & (hsv[:, :, 1] < 35))
+    return v
+
+
+_PANEL = None
 
 
 def panel_box(frame):
-    """The builder/lab dropdown list has a pure-white 2px border: columns white for a long vertical run.
-    Returns (x0, x1, y0, y1) of its inside, or None if no list is open."""
-    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    cols = np.where((g >= 245).sum(axis=0) > g.shape[0] * 0.3)[0]
-    if len(cols) < 2:
+    """The upgrade panel (Build button: builders / lab / pets tabs) on the right: (x0, x1, y0, y1) of its list
+    area, or None. Told by its red X at the top-right - and only when nothing covers it (an upgrade window on
+    top dims it to half brightness)."""
+    global _PANEL
+    _PANEL = _PANEL or Vision()
+    hit = _PANEL.find(frame, "panel_close", 0.85)
+    k = frame.shape[1] / 1920
+    if not hit or hit[0] < 1840 * k or hit[1] > 70 * k or not _PANEL.undimmed(frame, "panel_close", hit):
         return None
-    right = cols[cols - cols[0] >= 250]  # the list's right border is the NEXT long white column, not the last
-    if len(right) == 0:                  # (the Builder Base has a white edge at the far right of the screen)
-        return None
-    x0, x1 = int(cols[0]), int(right[0])
-    ys = np.where(g[:, x0] >= 245)[0]
-    # the longest unbroken run is the list's own border (a button card below can line up with it)
-    runs = np.split(ys, np.where(np.diff(ys) > 3)[0] + 1)
-    run = max(runs, key=len)
-    return x0 + 3, x1 - 2, int(run[0]) + 3, int(run[-1]) - 2
+    return int(1412 * k), int(1912 * k), int(60 * k), int(945 * k)
 
 
 # Top bar counters sit in fixed places (1920x1080 layout) whatever icon/skin shows (builder, goblin, ...).
-TOP_BAR = {"lab": ((662, 61), (680, 30, 820, 95), (600, 20, 680, 105)),
-           "builder": ((902, 70), (955, 30, 1060, 95), (840, 20, 920, 105)),  # tap point, counter, icon
-           "bb_lab": ((860, 60), (840, 30, 940, 95), (750, 20, 830, 105)),
-           "bb_builder": ((1040, 60), (1080, 30, 1185, 95), (990, 20, 1075, 105))}
-KIND_NAMES = {"builder": "Builder", "lab": "Lab", "bb_builder": "Builder Base builder", "bb_lab": "Star Lab"}
-BB_STARS = (95, 866, 200, 910)  # the 'x/y' daily star counter on the Builder Base Attack button
+# (redesign: both counters sit above the Build button, which opens one panel with a tab per kind)
+TOP_BAR = {"lab": ((1794, 960), (1793, 812, 1877, 856), (1805, 762, 1865, 814)),
+           "builder": ((1794, 960), (1700, 812, 1782, 856), (1712, 762, 1772, 814)),  # tap point, counter, icon
+           "bb_lab": ((1794, 960), (1793, 812, 1877, 856), (1805, 762, 1865, 814)),
+           "bb_builder": ((1794, 960), (1700, 812, 1782, 856), (1712, 762, 1772, 814))}
+KIND_NAMES = {"builder": "Builder", "lab": "Lab", "pets": "Pet House", "bb_builder": "Builder Base builder",
+              "bb_lab": "Star Lab"}
+BB_STARS = (85, 806, 225, 848)  # the 'x/y' daily star counter above the Builder Base Battle button
+
+
+# The panel's tabs (1920x1080): home has builders / lab / blacksmith / pets, the Builder Base builders / Star Lab
+LIST_TABS = {"builder": (1466, 1010), "lab": (1596, 1010), "pets": (1846, 1010),
+             "bb_builder": (1532, 1010), "bb_lab": (1790, 1010)}
 
 
 def top_bar(frame, kind):
-    """(tap point, counter box) of the lab or builder counter, scaled to this screen."""
+    """(the list, counter box) of the lab or builder counter, scaled to this screen. The list is ('list', kind):
+    Bot.tap() opens the panel on that kind's tab, or closes the panel if it's open."""
     k = frame.shape[1] / 1920
-    (x, y), box, _ = TOP_BAR[kind]
-    return (int(x * k), int(y * k)), tuple(int(v * k) for v in box)
+    box = TOP_BAR[kind][1] if kind in TOP_BAR else (0, 0, 1, 1)
+    return ("list", kind), tuple(int(v * k) for v in box)
+
+
+def face_in(frame, box, name, conf=0.75):
+    """A small face template (goblin) inside a box of the screen."""
+    x0, y0, x1, y1 = box
+    c = crop(frame, (x0 - 15, y0 - 15, x1 + 15, y1 + 15), 0)
+    t = _GOBLIN.template(name)
+    if c is None or t is None or c.shape[0] < t[2].shape[0] * 2 or c.shape[1] < t[2].shape[1] * 2:
+        return False
+    return float(cv2.matchTemplate(cv2.resize(c, None, fx=SCALE, fy=SCALE, interpolation=cv2.INTER_AREA), t[2],
+                                   cv2.TM_CCOEFF_NORMED).max()) >= conf
+
+
+_GOBLIN = Vision()
 
 
 def goblin_icon(frame, kind):
     """The game shows the green goblin face on a counter only when the normal builders / researcher are all
-    busy and just the goblin (costs gems) is free. Measured: goblin 0.33-0.36 green, normal icons <=0.12."""
-    k = frame.shape[1] / 1920
-    c = crop(frame, tuple(int(v * k) for v in TOP_BAR[kind][2]), 0)
-    if c is None:
+    busy and just the goblin (costs gems) is free. The counters sit on see-through backing (grass shows
+    through), so it's matched by its face, not by colour."""
+    if kind not in TOP_BAR:
         return False
-    hsv = cv2.cvtColor(c, cv2.COLOR_BGR2HSV)
-    return float(((hsv[:, :, 0] >= 30) & (hsv[:, :, 0] <= 80) & (hsv[:, :, 1] > 90) & (hsv[:, :, 2] > 90)).mean()) > 0.22
+    k = frame.shape[1] / 1920
+    return face_in(frame, tuple(int(v * k) for v in TOP_BAR[kind][2]), "goblin_face")
 
 
 def read_counter(frame, box):
@@ -1196,7 +1226,7 @@ def settings_tag(frame):
     if not HAVE_TESS:
         return None
     k = frame.shape[1] / 1920
-    g = cv2.cvtColor(frame[int(226 * k):int(262 * k), int(860 * k):int(1120 * k)], cv2.COLOR_BGR2GRAY)
+    g = cv2.cvtColor(frame[int(209 * k):int(241 * k), int(870 * k):int(1060 * k)], cv2.COLOR_BGR2GRAY)
     try:
         t = pytesseract.image_to_string(cv2.resize(g, None, fx=3, fy=3), timeout=5,
                                         config="--psm 7 -c tessedit_char_whitelist=#0289PYLQGRJCUV").strip()
@@ -1213,7 +1243,7 @@ def settings_name(frame):
     if not HAVE_TESS:
         return None
     k = frame.shape[1] / 1920
-    g = cv2.cvtColor(frame[int(188 * k):int(228 * k), int(860 * k):int(1180 * k)], cv2.COLOR_BGR2GRAY)
+    g = cv2.cvtColor(frame[int(166 * k):int(206 * k), int(870 * k):int(1100 * k)], cv2.COLOR_BGR2GRAY)
     try:  # plain greyscale reads this chunky font best (binarising it made 'GeoCol2' into 'GeaCol2d')
         words = pytesseract.image_to_string(cv2.resize(g, None, fx=3, fy=3), config="--psm 7", timeout=5).split()
     except Exception:
@@ -1241,76 +1271,70 @@ def export_items(data):
     return out
 
 
-def available_slots(frame):
-    """(normal, goblin) free slots from an open builder/lab list's 'Available!' rows. The goblin builder /
-    researcher (costs gems) has a green face next to its row; the normal builder/researcher doesn't."""
-    box = panel_box(frame)
-    if not box or not HAVE_TESS:
+def available_slots(frame, kind):
+    """(normal, goblin) free slots, from the open panel's tab for this kind: its 'free/total' counter, and its
+    icon - the green goblin face when only the (gem-costing) goblin builder / researcher is free."""
+    if not panel_box(frame):
         return 0, 0
-    x0, x1, y0, y1 = box
-    c = frame[y0:y1, x0:x1]
-    try:
-        d = pytesseract.image_to_data(cv2.cvtColor(c, cv2.COLOR_BGR2GRAY), config="--psm 11",
-                                      output_type=pytesseract.Output.DICT, timeout=10)
-    except Exception:
-        return 0, 0
-    normal = goblin = 0
-    for i, t in enumerate(d["text"]):
-        if t.lower().startswith("availab"):
-            x, y, h = d["left"][i], d["top"][i], d["height"][i]
-            face = cv2.cvtColor(c[max(0, y - 15):y + h + 15, max(0, x - 80):max(1, x - 8)], cv2.COLOR_BGR2HSV)
-            green = ((face[:, :, 0] >= 30) & (face[:, :, 0] <= 85) & (face[:, :, 1] > 80) & (face[:, :, 2] > 80))
-            if green.size and green.mean() > 0.15:  # measured: goblin ~0.3, normal faces <0.05
-                goblin += 1
-            else:
-                normal += 1
-    return normal, goblin
+    k = frame.shape[1] / 1920
+    x, y = LIST_TABS[kind]
+    c = read_counter(frame, tuple(int(v * k) for v in (x - 55, y + 2, x + 55, y + 42)))
+    free = c[0] if c else 0
+    if face_in(frame, tuple(int(v * k) for v in (x - 32, y - 42, x + 32, y)), "goblin_tab"):
+        return 0, free
+    return free, 0
 
 
 def list_rows(frame):
-    """Rows of an open builder/lab list: [(name, price, affordable, (x, y))]. Prices are white when you can
-    afford them and red when you can't; section headers are green; in-progress rows show a timer next to a
-    green progress bar and are skipped."""
+    """Rows of the open upgrade panel: [(name, price, affordable, (x, y))]. Each row is a card: name (white;
+    green = a new building to place, returned as 'New ...'), timer, and the price under it - white when you can
+    afford it, red when you can't. Upgrades in progress (green bars) and section headers have no price."""
     box = panel_box(frame)
     if not box or not HAVE_TESS:
         return []
     x0, x1, py0, py1 = box
+    k = frame.shape[1] / 1920
     c = frame[py0:py1, x0:x1]
     hsv = cv2.cvtColor(c, cv2.COLOR_BGR2HSV)
     b, g, r = (c[:, :, i].astype(int) for i in range(3))
     white = (hsv[:, :, 2] > 190) & (hsv[:, :, 1] < 60)
     red = (r > 170) & (r - g > 90) & (r - b > 60)
-    green = (g > 170) & (g - r > 40) & (g - b > 60)
-    W, H = x1 - x0, py1 - py0
-    split = int(W * 0.62)
-    prof = (white | red)[:, :split].sum(axis=1)
-    out, y = [], 0
+    green = (g > 150) & (g - r > 30) & (g - b > 60)
+    pc0, pc1, nx0, nx1 = (int(v * k) for v in (288, 466, 80, 330))  # price column / name column, in the panel
+    prof = (white | red)[:, pc0:pc1].sum(axis=1)
+    out, y, H = [], 0, c.shape[0]
     while y < H:
         if prof[y] <= 3:
             y += 1
             continue
+        ya = y
+        while y < H and prof[y] > 3:
+            y += 1
         yb = y
-        while yb < H and prof[yb] > 3:
-            yb += 1
-        ya, y = y, yb + 1
-        if not 16 <= yb - ya <= 70 or green[ya:yb].sum() > white[ya:yb].sum():  # noise / section header
+        if not 16 * k <= yb - ya <= 40 * k:
             continue
-        a, bb = max(0, ya - 8), min(H, yb + 8)
-        if green[a:bb, split - 60:].sum() > 50:  # upgrade in progress
-            continue
-        pw, pr = white[a:bb, split - 60:], red[a:bb, split - 60:]
+        a, bb = max(0, ya - 4), min(H, yb + 4)
+        pw, pr = white[a:bb, pc0:pc1], red[a:bb, pc0:pc1]
         is_red = pr.sum() > pw.sum()
-        price = read_digit_blobs(pr if is_red else pw)
-        nm = (white | red)[ya:yb, :split].astype(np.uint8) * 255
-        k = 48 / nm.shape[0]
-        nm = cv2.resize(nm, None, fx=k, fy=k, interpolation=cv2.INTER_LINEAR)
+        price = read_digit_blobs(pr if is_red else pw)  # a timer ('4d', '7h 29m') isn't a number: None
+        if not price or price < 100:
+            continue
+        na, nb = max(0, ya - int(52 * k)), max(0, ya - int(6 * k))  # the name line sits just above the price
+        if nb - na < 20 * k:
+            continue  # name cut off at the top edge
+        nm = (white | green)[na:nb, nx0:nx1].astype(np.uint8) * 255
+        s = 48 / nm.shape[0]
+        nm = cv2.resize(nm, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
         try:
             name = pytesseract.image_to_string(cv2.copyMakeBorder(255 - nm, 30, 30, 30, 30, cv2.BORDER_CONSTANT,
                                                                   value=255), config="--psm 7", timeout=5).strip()
         except Exception:
             name = ""
-        if price and price >= 1000 and name and ya > 6:  # ya>6: skip the half-cut row at the top edge
-            out.append((name, price, not is_red, (x0 + W // 4, py0 + (ya + yb) // 2)))
+        name = re.sub(r"^[^A-Za-z0-9]+|^[A-Za-z]{1,2}\s+(?=[A-Z])", "", name)  # pet-row icons read as 'fl '
+        if green[na:nb, nx0:nx1].sum() > white[na:nb, nx0:nx1].sum():
+            name = "New " + name
+        if name:
+            out.append((name, price, not is_red, (x0 + int(200 * k), py0 + (na + nb) // 2)))
     return out
 
 
@@ -1343,7 +1367,10 @@ class Bot:
         self._bb_next = {}     # account -> time of its next Builder Base visit
         self._acc_idx = -1
         self.loot = {}        # account -> [gold, elixir, dark, attacks] farmed this session
-        self._names = list(dict.fromkeys((cfg.get("account_tags") or {}).values()))  # misreads snap to these
+        # misreads snap to these: tagged accounts, accounts with saved scans, the Supercell ID list's names
+        self._names = list(dict.fromkeys([*(cfg.get("account_tags") or {}).values(),
+                                          *(k.split(" (")[0] for k in (cfg.get("scans") or {})),
+                                          *(a["sc"] for a in cfg.get("sc_accounts") or [] if a.get("sc"))]))
         self._saving_home = None  # account farming for its next home plan target: no Builder Base trips meanwhile
         self._bb_saving = None  # resource the Builder Base plan is saving up (the Star Lab leaves it alone)
         self._view = None  # background zoom + pan for the base being scouted
@@ -1390,11 +1417,27 @@ class Bot:
         hit = self.v.find(frame, name, self.cfg["match_confidence"])
         if hit and name in ("attack_button", "bb_attack_button") and not self.v.undimmed(frame, name, hit):
             return None  # a popup/panel is darkening the village: not really on the home screen
+        if hit and name == "attack_button" and self.v.find(frame, "bb_attack_button", 0.8):
+            return None  # both villages' buttons say 'Battle': the Builder Base's has crossed axes
         return hit
 
     def tap(self, xy, delay=None):
+        if isinstance(xy[0], str):  # top_bar()'s list: open the upgrade panel on that kind's tab, or close it
+            return self.toggle_list(xy[1], 1.0 if delay is None else delay)
         self.adb.tap(*xy)
         self.sleep(self.cfg["tap_delay"] if delay is None else delay)
+
+    def toggle_list(self, kind, delay):
+        f = self.shot()
+        k = f.shape[1] / 1920
+        if panel_box(f):
+            self.adb.tap(int(1885 * k), int(33 * k))  # its red X
+        else:
+            self.adb.tap(int(1794 * k), int(960 * k))  # Build
+            self.sleep(1.2)
+            x, y = LIST_TABS[kind]
+            self.adb.tap(int(x * k), int(y * k))
+        self.sleep(delay)
 
     def wait_for(self, name, timeout, poll=0.8):
         end = time.time() + timeout
@@ -1453,6 +1496,8 @@ class Bot:
                             unknown_since = None
                         elif self.bb_bonus(self._last_name or "?"):  # the Star Bonus popup (home or Builder
                             unknown_since = None                     # Base) - known, so no need to ask Groq
+                        elif self.tutorial(frame):  # the redesign's one-off tutorials
+                            unknown_since = None
                         elif self.event_chest(frame):  # chest event: open it, take the reward
                             unknown_since = None
                         elif self.loading_screen(frame):  # Supercell logo / loading art / clouds / a live replay
@@ -1463,6 +1508,10 @@ class Bot:
                             unknown_since = None
                         elif self.close_popup(frame):  # a window's red X: always just closes it
                             unknown_since = None
+                        elif self.v.find(frame, "goblin_gem_prompt", 0.85):  # 'Hey Chief!': pay gems for the
+                            self.log("Declining the goblin builder's gem offer (Back).")  # goblin builder - never
+                            self.adb.back()
+                            self.sleep(1.0)
                         elif self.find(frame, "wall_okay_button"):
                             self.log("Closing an Okay/Cancel dialog with Back (never confirms).")
                             self.adb.back()
@@ -1517,13 +1566,13 @@ class Bot:
     def account_name(self, frame):
         """Player name at the top-left of the home screen (e.g. 'GeoCol3'), snapped to names already seen."""
         k = frame.shape[1] / 1920
-        c = frame[int(8 * k):int(52 * k), int(140 * k):int(520 * k)]
+        c = frame[int(78 * k):int(124 * k), int(180 * k):int(600 * k)]  # next to the Town Hall picture
         hsv = cv2.cvtColor(c, cv2.COLOR_BGR2HSV)
         raw = ((hsv[:, :, 2] > 170) & (hsv[:, :, 1] < 60)).astype(np.uint8)
         n, lab, st, _ = cv2.connectedComponentsWithStats(raw, 8)
         # letters: 8-24px tall, not touching the crop edge, sitting on one baseline. Decorations behind the name
         # (cakes, statues, snow) are taller / elsewhere - picking by 'tallest shape' dropped the lower-case letters.
-        cand = [i for i in range(1, n) if 8 * k <= st[i, 3] <= 24 * k and st[i, 2] <= 30 * k
+        cand = [i for i in range(1, n) if 10 * k <= st[i, 3] <= 40 * k and st[i, 2] <= 40 * k
                 and st[i, 1] > 0 and st[i, 1] + st[i, 3] < c.shape[0]]
         base = np.median([st[i, 1] + st[i, 3] for i in cand]) if cand else 0
         keep = [i for i in cand if abs(st[i, 1] + st[i, 3] - base) <= 3 * k]
@@ -1542,7 +1591,21 @@ class Bot:
         except Exception:
             words = []
         name = words[0] if words else ""
+        # the trailing number tells GeoCol / GeoCol2 / GeoCol3 apart, and Tesseract misses it in the new font: read
+        # it with the game's own digit shapes instead (exact), and count the letters before it as a cross-check
+        glyphs, tail = digit_glyphs(), ""
+        for i in reversed(keep if glyphs is not None else []):
+            x, y, w, h = st[i, :4]
+            g = cv2.resize((lab[y:y + h, x:x + w] == i).astype(np.float32), (20, 28), interpolation=cv2.INTER_AREA)
+            dist = [float(np.abs(g - glyphs[d]).mean()) for d in range(10)]
+            if min(dist) > 0.12 or h < 0.85 * max(st[j, 3] for j in keep):  # letters / lower-case: stop
+                break
+            tail = str(dist.index(min(dist))) + tail
+        letters = len(keep) - len(tail)
+        same = [n for n in self._names if re.sub(r"\D", "", n) == tail and abs(len(re.sub(r"\d", "", n)) - letters) <= 1]
         digits = re.sub(r"\D", "", name)  # GeoCol2 vs GeoCol3 are different accounts: never snap across digits
+        if len(same) == 1 and keep:  # one known account fits the shapes: that's it, whatever Tesseract made of it
+            name, digits = same[0], tail
         near = difflib.get_close_matches(name, [n for n in self._names if re.sub(r"\D", "", n) == digits], 1, 0.7)
         if near:
             self._last_name = near[0]
@@ -1579,6 +1642,41 @@ class Bot:
         self._pre = self._cur  # storage right before this attack
         self.tap(self.hits["attack_button"])
 
+    def keep_builders_busy(self, frame, storage):
+        """'All builders busy': a free builder gets the best upgrade there is (your plan first, else the priciest
+        affordable); if nothing is affordable, attack and look again with more loot."""
+        free = self.free_slots(frame, "builder")
+        if free and time.time() >= self._upgrade_backoff.get("builder", 0):
+            return self.upgrade_from_list("builder")
+        if free == 0 and not getattr(self, "_busy_said", False):
+            self._busy_said = True
+            self.log("All builders busy on this account - farming until one is free.", "ok")
+        elif free:
+            self._busy_said = False
+        self.attack_now()
+
+    def open_settings(self, delay=2.0):
+        """Settings now lives in the profile window: the player card (top-left) -> its Settings tab."""
+        k = self.shot().shape[1] / 1920
+        self.tap((int(90 * k), int(120 * k)), 1.8)
+        self.tutorial(self.shot())  # first time: 'Settings has moved to the Profile Menu'
+        self.tap((int(1518 * k), int(90 * k)), delay)
+
+    def tutorial(self, frame):
+        """The game's one-off tutorials after the redesign (the Builder Menu, 'Settings has moved'...): the guide
+        talks, sometimes with an arrow at a button. Follow the arrow (only ever Build), else tap a blank spot -
+        never a button. True if one was showing."""
+        if not self.v.find(frame, "tutorial_guide", 0.85):
+            return False
+        k = frame.shape[1] / 1920
+        if self.v.find(frame, "tutorial_arrow_build", 0.85):
+            self.log("Game tutorial: opening the new Builder Menu as it asks.")
+            self.tap((int(1794 * k), int(960 * k)), 2.0)
+        else:
+            self.log("Game tutorial: tapping on.")
+            self.tap((int(700 * k), int(600 * k)), 1.5)
+        return True
+
     def ambiguous(self):
         """True while the top-left name is one that two accounts share ('GeoCol2' and 'GeoCol2 (GeoCol2)') and
         nothing yet says which of them this is - e.g. after switching accounts by hand."""
@@ -1589,7 +1687,7 @@ class Bot:
         """Open the Supercell ID list just to note the accounts on it (for the phone view's picker), then close it."""
         self.back_to_village()
         f = self.shot()
-        self.tap(self.find(f, "settings_cog_button") or (int(1842 * f.shape[1] / 1920), int(765 * f.shape[1] / 1920)), 2.0)
+        self.open_settings()
         sw = self.wait_for("switch_account_button", 5)
         if sw:
             self.tap(sw, 2.5)
@@ -1635,6 +1733,8 @@ class Bot:
                 self.log("Builder Base only: couldn't find the boat - trying again in 2 min.", "warn")
                 self.sleep(120)
             return
+        if self.mode == "busy":  # keep every home builder working on this account: upgrade whenever one is free,
+            return self.keep_builders_busy(frame, storage)  # farm in between. No switching / walls / Builder Base.
         if self.mode == "walls":  # Walls only: farm, and every time the next wall level is affordable, buy it
             if self.maybe_rescan("builder", hours=1):  # keeps the dashboard's wall count current
                 return
@@ -1646,7 +1746,7 @@ class Bot:
             if self.spend_bank(storage, price):
                 return
             return self.attack_now()
-        for kind in ("builder", "lab"):
+        for kind in ("builder", "lab", "pets"):
             if self.cfg[f"{kind}_upgrades_enabled"] and time.time() >= self._upgrade_backoff.get(kind, 0):
                 sv = self._saving_home if kind == "builder" else None
                 have = {"gold": storage.get("gold"), "elixir": storage.get("elixir"), "dark": self._cur[1][2]}
@@ -2301,10 +2401,10 @@ class Bot:
             btn = pair[0] if cur == "gold" else pair[1]
             k = f.shape[1] / 1920
             # bar layout: home - Remove Wall, Add +10, Add +1, gold, elixir; Builder Base - Remove Wall, Add Wall, gold..
-            remove = (pair[0][0] - int((424 if bb else 612) * k), pair[0][1] + int(12 * k))
-            if bb and balance:  # Builder Base: it starts with 1 wall - add walls while the next one is affordable
+            remove = (pair[0][0] - int((424 if bb else 631) * k), pair[0][1] + int(12 * k))
+            if balance:  # it starts with 1 wall: add walls while the next one is affordable
                 unit = self.bar_price(self.shot(), btn)
-                add = (pair[0][0] - int(212 * k), pair[0][1] + int(12 * k))
+                add = (pair[0][0] - int(211 * k), pair[0][1] + int(12 * k))
                 cost, same = unit, 0
                 while unit and cost and cost + unit <= balance and same < 2:  # quick bursts, then re-read the total
                     for _ in range(min((balance - cost) // unit, 20)):     # (taps that fast can drop a few)
@@ -2323,6 +2423,10 @@ class Bot:
             self.tap(btn, 1.2)
         ok = self.wait_for("wall_okay_button", 3 if want is None else 1)  # it animates in (slower at 30 FPS)
         frame = self.shot()
+        if self.v.find(frame, "goblin_gem_prompt", 0.85):  # 'Hey Chief!' - every builder busy: the goblin wants gems
+            self.adb.back()
+            self._bank_backoff["builder"] = time.time() + 600
+            return self.wall_fail("every builder is busy (the goblin builder asked for gems - declined)", frame)
         if ok:  # 'Upgrade Walls' dialog: check it says Walls + this currency + a price, never gems
             h, w = frame.shape[:2]
             try:
@@ -2406,23 +2510,23 @@ class Bot:
         if to == "home":
             self.bb_collect()  # collectors + the Elixir Cart before leaving (it moves the camera, so first)
         for _ in range(2):
-            boat = self.find_any_zoom(self.shot(), "bb_boat")
+            boat = self.find_any_zoom(self.shot(), "bb_boat", 0.85)
             if not boat:  # zoomed in (e.g. after an upgrade on the far village): zoom out so the sweep covers the map
                 zoom_out(self.adb)
                 self.sleep(0.8)
-                boat = self.find_any_zoom(self.shot(), "bb_boat")
+                boat = self.find_any_zoom(self.shot(), "bb_boat", 0.85)
             for mv in sweep:
                 if boat:
                     break
                 self.adb.swipe(*mv, 450)
                 self.sleep(0.9)
-                boat = self.find_any_zoom(self.shot(), "bb_boat")
+                boat = self.find_any_zoom(self.shot(), "bb_boat", 0.85)
             if boat:
                 if boat[1] < 200 or boat[0] > 1500:  # under the resource bars: a tap there opens the bar's
                     # tooltip (which then hides the boat) - drag the map to bring the boat toward the middle
                     self.adb.swipe(960, 540, 960 + (960 - boat[0]) // 2, 540 + (540 - boat[1]) // 2, 600)
                     self.sleep(1.0)
-                    boat = self.find_any_zoom(self.shot(), "bb_boat") or boat
+                    boat = self.find_any_zoom(self.shot(), "bb_boat", 0.85) or boat
                 self.tap(boat, 2.0)
                 if self.wait_for(want, 25, poll=1.0):
                     self.sleep(1.0)
@@ -2462,13 +2566,13 @@ class Bot:
         into the middle, then tap the cart (found by its bubble / look / usual spot)."""
         zoom_out(self.adb)
         self.sleep(0.8)
-        boat = self.find_any_zoom(self.shot(), "bb_boat")
+        boat = self.find_any_zoom(self.shot(), "bb_boat", 0.85)
         for _ in range(4):  # the dock is at the top right of the island: look that way (as the boat trip does)
             if boat:
                 break
             self.adb.swipe(1300, 300, 800, 600, 450)
             self.sleep(0.9)
-            boat = self.find_any_zoom(self.shot(), "bb_boat")
+            boat = self.find_any_zoom(self.shot(), "bb_boat", 0.85)
         if not boat:  # the boat hides behind the side buttons at the map's edge - but the cart's bubble may show
             f = self.shot()
             for xy in [p for p in self.matches(f, "bb_elixir_bubble", 0.7) if 250 < p[0] < 1650 and 150 < p[1] < 820]:
@@ -2794,23 +2898,23 @@ class Bot:
 
     def storage_total(self, frame):
         """Gold + elixir + dark elixir, for checking an upgrade really took the resources."""
-        regions = {"bank_dark_region": (1560, 225, 1830, 300), **self.cfg["ocr_regions"]}  # default: 1920x1080 bar
+        regions = {**NEW_UI_REGIONS, **self.cfg["ocr_regions"]}
         vals = [white_number(frame, regions[r]) for r in
                 ("bank_gold_region", "bank_elixir_region", "bank_dark_region") if r in regions]
         return None if not vals or None in vals else vals
 
     def back_to_village(self, icon=None):
         """Close windows/lists/dialogs until the plain village shows. Back closes game windows and
-        cancels dialogs; a dropdown list is closed by tapping its icon."""
+        cancels dialogs; the upgrade panel (Back doesn't close it) by its X."""
         for _ in range(6):
             f = self.shot()
             if self.reload_if_disconnected(f):
                 continue
-            if (self.find(f, "wall_okay_button") or self.find(f, "lab_picker_title")
+            if panel_box(f):  # the upgrade panel, nothing over it
+                self.tap(("list", "builder"), 0)
+            elif (self.find(f, "wall_okay_button") or self.find(f, "lab_picker_title")
                     or not self.at_village(f)):  # dialogs / game windows (they hide Attack)
                 self.adb.back()
-            elif panel_box(f) and icon:  # a dropdown list leaves Attack visible; its icon closes it
-                self.adb.tap(*icon)
             else:
                 return
             self.sleep(0.9)
@@ -2832,7 +2936,7 @@ class Bot:
         if not panel_box(frame):
             self.tap(icon, 1.3)
         self.sleep(0.5)  # let the list finish sliding open before reading its 'Available!' rows
-        normal, goblin = available_slots(self.shot())
+        normal, goblin = available_slots(self.shot(), kind)
         # Only refuse when the top bar agrees (goblin face / 0 free): one read of a still-moving list isn't enough.
         if kind.startswith("bb_") and free_before:
             normal = free_before  # the Builder Base list has no 'Available!' rows: trust the top bar counter
@@ -2969,7 +3073,8 @@ class Bot:
             return self.log(f"{KIND_NAMES[kind]}: Confirm shows {shown}, list said {price:,} - not risking it.", "warn")
         self.tap(hit, 2.0)
         self.back_to_village(icon)  # also cancels any 'all builders busy - use gems?' prompt
-        for _ in range(3):  # the counters can lag (or a selected building's bar hides them) for a moment
+        for _ in range(8):  # the counters count down for a few seconds after an upgrade (or a selected building's
+            # bar hides them)
             frame = self.shot()
             after, free_after = self.storage_total(frame), self.free_slots(frame, kind)
             spent = (before and after and any(b - a >= price * 0.9 for b, a in zip(before, after))) or (
@@ -2985,7 +3090,7 @@ class Bot:
             self.plan_progress(*self._started)
         else:
             self._upgrade_backoff[kind] = time.time() + 1800
-            self.log(f"{KIND_NAMES[kind]}: '{nm}' didn't start (all {'builders' if kind == 'builder' else 'lab slots'} "
+            self.log(f"{KIND_NAMES[kind]}: '{nm}' didn't start (all {'builders' if kind.endswith('builder') else 'slots'} "
                      f"busy?) - checking again in 30 min.")
 
     # --- upgrade planner: per-account scans + targets ---
@@ -3011,14 +3116,14 @@ class Bot:
         return [(nm, p, ok) for (nm, p), ok in seen.items()]
 
     def plan_items(self, kind):
-        if kind.endswith("lab"):
+        if kind.endswith(("lab", "pets")):
             return []
         base = "builder" if kind.startswith("bb_") else "home"
         return ((self.cfg.get("plans") or {}).get(self._last_name or "?") or {}).get(base) or []
 
     def plan_positions(self, kind, seen):
         """Record this account's scan, then ({(name, price): position in its plan}, {(name, price): level})."""
-        if kind.endswith("lab"):
+        if kind.endswith(("lab", "pets")):
             return {}, {}
         base = "builder" if kind.startswith("bb_") else "home"
         sd = ((self.cfg.get("scans") or {}).get(self._last_name) or {}).get(base) or {}
@@ -3200,9 +3305,8 @@ class Bot:
             return None
         self._clip_warned = False
         self.back_to_village()
-        f = self.shot()
-        k = f.shape[1] / 1920
-        self.tap(self.find(f, "settings_cog_button") or (int(1842 * k), int(765 * k)), 0.6)
+        k = self.shot().shape[1] / 1920
+        self.open_settings(0.6)
         # strict matches only: a looser one takes look-alike green buttons (Credits, Change Name...)
         more = None
         for _ in range(6):
@@ -3237,7 +3341,7 @@ class Bot:
             for attempt in range(2) if hit else ():  # a 2nd Copy if the clipboard didn't get it (slow to sync)
                 self.sleep(0.6)  # the page glides on after a drag: tap where the row has settled
                 hit = self.v.find(self.shot(), "export_copy_row", 0.9) or hit
-                self.tap((hit[0] + int(398 * k), hit[1]), 1.0)  # the green Copy button at the row's right
+                self.tap((hit[0] + int(416 * k), hit[1]), 1.0)  # the green Copy button at the row's right
                 for _ in range(5):
                     try:
                         raw = read_clipboard()
@@ -3305,7 +3409,7 @@ class Bot:
 
     def maybe_rescan(self, kind, hours=6):
         """Builders all busy: read the list anyway if this account's planner scan is missing or old. True if it did."""
-        if kind.endswith("lab") or not self._last_name or self._last_name == "?":
+        if kind.endswith(("lab", "pets")) or not self._last_name or self._last_name == "?":
             return False
         base = "builder" if kind.startswith("bb_") else "home"
         sd = ((self.cfg.get("scans") or {}).get(self._last_name) or {}).get(base) or {}
@@ -3370,9 +3474,6 @@ class Bot:
         green button in the bottom part of the screen. Either way the caller only taps it if the price equals the
         list price, so a gem button can never be pressed."""
         f = self.shot()
-        if not kind.startswith("bb_"):
-            hit = self.find(f, "confirm_wall_upgrade_button")
-            return (hit, confirm_price(f, hit)) if hit else (None, None)
         H = f.shape[0]
         hsv = cv2.cvtColor(f[int(H * 0.6):], cv2.COLOR_BGR2HSV)
         m = ((hsv[:, :, 0] >= 35) & (hsv[:, :, 0] <= 75) & (hsv[:, :, 1] > 150) & (hsv[:, :, 2] > 150)).astype(np.uint8)
@@ -3386,7 +3487,10 @@ class Bot:
         return (x + w // 2, y + h // 2), white_number(f, (x, y + 10, x + int(w * 0.72), y + h - 10))
 
     def free_slots(self, frame, kind):
-        """Normal builders / lab slots free. A goblin icon means only the (gem-costing) goblin is free = 0."""
+        """Normal builders / lab slots free. A goblin icon means only the (gem-costing) goblin is free = 0.
+        Pets have no counter on the village (None: the panel's tab is read once it's open)."""
+        if kind not in TOP_BAR:
+            return None
         if goblin_icon(frame, kind):
             return 0
         c = read_counter(frame, top_bar(frame, kind)[1])
@@ -3503,10 +3607,7 @@ class Bot:
             self._rotate_pause_until = time.time() + 1800
             self.log("Every account's builders/lab are busy - farming here, checking again in 30 min.", "ok")
             return False
-        frame = self.shot()
-        k = frame.shape[1] / 1920
-        cog = self.find(frame, "settings_cog_button") or (int(1842 * k), int(765 * k))
-        self.tap(cog, 2.0)
+        self.open_settings()
         sw = self.wait_for("switch_account_button", 5)
         tag = settings_tag(self.shot()) if sw else None
         sc_of = self.cfg.setdefault("sc_of_tag", {})
@@ -3579,6 +3680,8 @@ class Bot:
                     self._last_name = self._sc_key
                 self.emit("state", f"Home village ({self._last_name})")
                 return True
+            if self.tutorial(f) or self.event_chest(f) or self.close_popup(f):
+                continue
             if self.find(f, "wall_okay_button") or time.time() > end - 60 + 6 * (backs + 1):
                 if backs >= 2 and backs % 2 == 0 and self.groq_on("groq_supervisor"):
                     self.groq_rescue(f)  # e.g. an event character's speech bubble: a tap moves it on, Back doesn't
@@ -3671,8 +3774,8 @@ class Bot:
             f = self.shot()
             if self.find(f, "wall_okay_button"):
                 self.adb.back()
-            elif self.find_wall_rows(f):
-                self.adb.tap(*top_bar(f, "builder")[0])
+            elif panel_box(f):
+                self.tap(("list", "builder"), 0)
             else:
                 return
             self.sleep(0.8)
@@ -4435,6 +4538,7 @@ SIDE, NAV_ON = "#141414", "#262b33"  # sidebar, selected page
 # what the mode picker shows: mode -> (title, one line, icon in wiki/ui)
 MODES = {"farm": ("Full farm", "Attacks + upgrades", "king"), "loot": ("Loot only", "Just attack", "gold"),
          "walls": ("Walls only", "Farm + buy walls", "wall"),
+         "busy": ("All builders busy", "This account, home base", "hammer"),
          "bb_loot": ("BB loot", "Builder Base attacks", "bgold"),
          "bb_farm": ("BB farm", "BB upgrades", "builderhall"),
          "bb_walls": ("BB walls", "Builder Base walls", "wall")}
