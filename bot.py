@@ -39,6 +39,7 @@ import difflib
 import glob
 import hashlib
 import http.server
+import io
 import json
 import logging
 import logging.handlers
@@ -64,7 +65,7 @@ from tkinter import messagebox, ttk
 import cv2
 import numpy as np
 import sv_ttk
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
 try:
     import pytesseract
@@ -75,7 +76,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 65  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 66  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -4524,8 +4525,9 @@ def battery():
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-BG, CARD, MUTED, TEXT = "#1c1c1c", "#2b2b2b", "#9a9a9a", "#e6e6e6"
-SIDE, NAV_ON = "#141414", "#262b33"  # sidebar, selected page
+BG, CARD, MUTED, TEXT = "#0f1218", "#171b24", "#8a93a8", "#eceef4"  # page, card, secondary text, text
+SIDE, NAV_ON = "#0b0d12", "#1a1f2b"  # sidebar, selected page
+CARD2, CARD_HI, DEEP, LINE = "#1f2430", "#2a3142", "#0b0d12", "#252b38"  # tile in a card, hover, wells, borders
 # what the mode picker shows: mode -> (name, what it does, icon in wiki/ui), grouped by village
 MODES = {"farm": ("Farm & Upgrade", "Attacks and keeps every builder, the lab and pets busy.", "king"),
          "loot": ("Attack Only", "Just attacks on this account - no upgrades, walls or switching.", "gold"),
@@ -4536,7 +4538,58 @@ MODES = {"farm": ("Farm & Upgrade", "Attacks and keeps every builder, the lab an
          "bb_walls": ("Walls", "Builder Base walls: farms and buys them.", "wall")}
 VILLAGES = (("Home Village", ("farm", "loot", "walls")), ("Builder Base", ("bb_farm", "bb_loot", "bb_walls")))
 mode_name = lambda m: f"{MODES[m][0]} · {'Builder Base' if m.startswith('bb_') else 'Home Village'}"
-GREEN, AMBER, RED, BLUE, GOLD, PINK = "#4cc38a", "#e5b454", "#ff6b6b", "#57a6ff", "#f5c542", "#d77bff"
+GREEN, AMBER, RED, BLUE, GOLD, PINK = "#3ddc97", "#f2b84b", "#ff6b6b", "#5aa9ff", "#f5b942", "#e07bff"
+
+
+def mix(a, b, t):
+    """Colour between a and b ('#rrggbb'), t 0..1."""
+    a, b = (int(a[i:i + 2], 16) for i in (1, 3, 5)), (int(b[i:i + 2], 16) for i in (1, 3, 5))
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
+
+
+def retheme(root):
+    """Sun Valley's dark sprites (buttons, inputs, switches...) recoloured to the app's palette: neutral greys get
+    the navy tint of BG/CARD, the blue accent becomes Clash gold. Then flat rounded cards and matching colours."""
+    try:  # (Tk hands sprites back without their alpha: recolour the sheet's PNG, then cut every sprite again)
+        im = Image.open(os.path.join(os.path.dirname(sv_ttk.__file__), "theme", "spritesheet_dark.png")).convert("RGBA")
+    except OSError:
+        im = None
+    if im is not None:
+        a = np.asarray(im).astype(np.float32)
+        rgb = a[:, :, :3]
+        sat = rgb.max(axis=2) - rgb.min(axis=2)
+        v = rgb.mean(axis=2)
+        t = np.clip((v - 70) / 110, 0, 1)[:, :, None]  # dark greys tinted fully, light ones (ticks) kept
+        tint = np.stack([v * 0.78, v * 0.86, v * 1.06 + 6], axis=2)
+        rgb = np.where((sat < 20)[:, :, None], tint * (1 - t) + rgb * t, rgb)
+        u8 = np.clip(rgb, 0, 255).astype(np.uint8)
+        hsv = cv2.cvtColor(u8, cv2.COLOR_RGB2HSV)
+        blue = (hsv[:, :, 0] >= 90) & (hsv[:, :, 0] <= 115) & (hsv[:, :, 1] > 70)  # the accent: #57c8ff, #2f60d8
+        hsv[:, :, 0] = np.where(blue, 20, hsv[:, :, 0])  # -> gold (OpenCV hue 20 = 40 degrees)
+        hsv[:, :, 1] = np.where(blue, np.minimum(hsv[:, :, 1], 190), hsv[:, :, 1])
+        u8 = np.where(blue[:, :, None], cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB), u8)
+        path = os.path.join(tempfile.gettempdir(), "lootfarmer_sprites.png")
+        Image.fromarray(np.dstack([u8, a[:, :, 3].astype(np.uint8)]), "RGBA").save(path)
+        root.tk.call("spritesheet", "configure", "-file", path)
+        root.tk.eval("""foreach {n x y w h} $::spriteinfo {
+            $::ttk::theme::sv_dark::I($n) copy spritesheet -from $x $y [expr {$x+$w}] [expr {$y+$h}] -compositingrule set
+        }""")
+    # cards: flat, rounded, a hairline border (the theme's card sprite is grey and shadowed)
+    k = 3  # drawn 3x, scaled down: smooth corners
+    im = Image.new("RGBA", (40 * k, 40 * k), (0, 0, 0, 0))
+    ImageDraw.Draw(im).rounded_rectangle((0, 0, 40 * k - 1, 40 * k - 1), radius=12 * k, fill=CARD, outline=LINE,
+                                         width=k)
+    root._card_img = ImageTk.PhotoImage(im.resize((40, 40), Image.LANCZOS), master=root)
+    s = ttk.Style(root)
+    s.element_create("LF.Card.field", "image", root._card_img, border=14, padding=4, sticky="nsew")
+    s.layout("Card.TFrame", [("LF.Card.field", {"sticky": "nsew", "children": [
+        ("Card.padding", {"expand": 1, "sticky": "nsew"})]})])
+    s.configure(".", background=CARD, foreground=TEXT, selectbackground=GOLD, selectforeground="#1b1405")
+    for st in ("TFrame", "TNotebook", "Bg.TLabel", "Bg.Switch.TCheckbutton", "Bg.TRadiobutton"):
+        s.configure(st, background=BG)
+    s.configure("Treeview", background=CARD, fieldbackground=CARD, foreground=TEXT)
+    s.configure("Treeview.Heading", background=CARD2, foreground=MUTED)
+    s.map("Treeview", background=[("selected", CARD_HI)], foreground=[("selected", TEXT)])
 LEVEL_COLORS = {"info": TEXT, "ok": GREEN, "warn": AMBER, "err": RED}
 UI_SCALE = 1.0  # set from the real DPI at startup so the layout isn't tiny on 150-200% displays
 
@@ -4816,7 +4869,7 @@ class PlannerTab(ttk.Frame):
                         font=("Segoe UI", size, "bold" if bold else "normal"), justify="left", **kw)
 
     def _chip(self, parent, text, cmd):
-        c = tk.Label(parent, text=text, bg="#3a3a3a", fg=TEXT, font=("Segoe UI", 9, "bold"), padx=S(7), pady=S(3),
+        c = tk.Label(parent, text=text, bg=CARD_HI, fg=TEXT, font=("Segoe UI", 9, "bold"), padx=S(7), pady=S(3),
                      cursor="hand2")
         c.bind("<Button-1>", lambda e: cmd())
         return c
@@ -4941,7 +4994,7 @@ class PlannerTab(ttk.Frame):
                 cv.move(t, pad - x[0], y1 - y0 + S(12))
                 row[0] = line + y1 - y0 + S(12)
                 x0, y0, x1, y1 = cv.bbox(t)
-            r = cv.create_rectangle(x0 - S(7), y0 - S(3), x1 + S(7), y1 + S(3), fill="#3a3a3a", width=0)
+            r = cv.create_rectangle(x0 - S(7), y0 - S(3), x1 + S(7), y1 + S(3), fill=CARD_HI, width=0)
             cv.tag_lower(r, t)
             for item in (t, r):
                 cv.tag_bind(item, "<Button-1>", lambda ev: cmd())
@@ -4964,7 +5017,7 @@ class PlannerTab(ttk.Frame):
         if many:
             x[0] = cv.bbox(cv.create_text(pad, y + S(3), text="or level", anchor="nw", fill=MUTED,
                                           font=("Segoe UI", 9)))[2] + S(6)
-            sp = tk.Spinbox(cv, from_=cur + 1, to=mx, width=5, bg="#3a3a3a", fg=TEXT, buttonbackground=CARD,
+            sp = tk.Spinbox(cv, from_=cur + 1, to=mx, width=5, bg=CARD_HI, fg=TEXT, buttonbackground=CARD,
                             relief="flat", insertbackground=TEXT)
             x[0] = cv.bbox(cv.create_window(x[0], y, window=sp, anchor="nw"))[2] + S(6)
             chip("Set", lambda: self.add(k, min(mx, max(cur + 1, int(sp.get())))) if sp.get().isdigit() else None, y)
@@ -4982,8 +5035,8 @@ class PlannerTab(ttk.Frame):
                 continue
             for lv, (r, t) in c["chips"]:
                 on = want.get(k, 0) >= lv
-                c["frame"].itemconfigure(r, fill=BLUE if on else "#3a3a3a")
-                c["frame"].itemconfigure(t, fill="#0b1a2b" if on else TEXT)
+                c["frame"].itemconfigure(r, fill=GOLD if on else CARD_HI)
+                c["frame"].itemconfigure(t, fill="#1b1405" if on else TEXT)
             if c["x"] is not None:
                 for item in c["x"]:
                     c["frame"].itemconfigure(item, state="normal" if k in want else "hidden")
@@ -5112,6 +5165,7 @@ class App(tk.Tk):
         self.geometry(f"{min(S(1240), int(sw * .92))}x{min(S(800), int(sh * .85))}+{int(sw * .04)}+{int(sh * .03)}")
         self.minsize(min(S(1060), int(sw * .8)), min(S(680), int(sh * .7)))
         sv_ttk.set_theme("dark")
+        retheme(self)
         for name in tkfont.names(self):  # the theme sizes fonts in pixels; scale them for high-DPI screens
             f = tkfont.nametofont(name, self)
             if name.startswith("SunValley") and f.cget("size") < 0:
@@ -5203,12 +5257,12 @@ class App(tk.Tk):
         return f
 
     def text_widget(self, parent, height):
-        t = tk.Text(parent, height=height, bg="#141414", fg=TEXT, insertbackground=TEXT, relief="flat",
+        t = tk.Text(parent, height=height, bg=DEEP, fg=TEXT, insertbackground=TEXT, relief="flat",
                     font=("Cascadia Mono", 9) if "Cascadia Mono" in self.tk.call("font", "families")
                     else ("Consolas", 9), padx=S(10), pady=S(8), wrap="word", borderwidth=0, highlightthickness=0)
         for lvl, col in LEVEL_COLORS.items():
             t.tag_configure(lvl, foreground=col)
-        t.tag_configure("ts", foreground="#6b6b6b")
+        t.tag_configure("ts", foreground="#565e70")
         t.configure(state="disabled")
         return t
 
@@ -5270,7 +5324,7 @@ class App(tk.Tk):
         link("🐞  Send debug report", lambda: self.send_report("sent by hand"))
         link("🕘  Switch version", self.pick_version)
         link("⟳  Restart the app", self.restart_app)
-        tk.Frame(foot, bg="#2a2a2a", height=1).pack(fill="x", pady=S(10))
+        tk.Frame(foot, bg=LINE, height=1).pack(fill="x", pady=S(10))
         conn = tk.Frame(foot, bg=SIDE)
         conn.pack(fill="x")
         self.pill = tk.Label(conn, text="●  Connecting…", bg=SIDE, fg=AMBER, font=("Segoe UI", 10, "bold"))
@@ -5400,7 +5454,7 @@ class App(tk.Tk):
         top.pack(fill="x", pady=S(0, 8))
         self.state_label = ttk.Label(top, text="Idle", style="Big.TLabel", foreground=MUTED)
         self.state_label.pack(side="left")
-        self.preview = tk.Canvas(live, bg="#141414", highlightthickness=0, height=S(240))
+        self.preview = tk.Canvas(live, bg=DEEP, highlightthickness=0, height=S(240))
         self.preview.pack(fill="both", expand=True)
         self.preview.create_text(10, 10, anchor="nw", text="The emulator screen appears here while farming.",
                                  fill=MUTED, font=("Segoe UI", 10), tags="hint")
@@ -5430,15 +5484,15 @@ class App(tk.Tk):
         for i, (key, col, icon) in enumerate([("gold", GOLD, "gold"), ("elixir", PINK, "elixir"),
                                               ("dark", "#b9a3ff", "dark")]):
             rates.columnconfigure(i, weight=1, uniform="rt")
-            cell = self.rate_cells[key] = tk.Frame(rates, bg="#232323", padx=S(8), pady=S(8))
+            cell = self.rate_cells[key] = tk.Frame(rates, bg=CARD2, padx=S(8), pady=S(8))
             cell.grid(row=0, column=i, sticky="nsew", padx=S(0 if i == 0 else 6, 0))
-            self.rate_icons[key] = tk.Label(cell, image=self.ui_icon(icon, S(24)), bg="#232323")
+            self.rate_icons[key] = tk.Label(cell, image=self.ui_icon(icon, S(24)), bg=CARD2)
             self.rate_icons[key].pack(side="left", padx=S(0, 8))
-            t = tk.Frame(cell, bg="#232323")
+            t = tk.Frame(cell, bg=CARD2)
             t.pack(side="left")
-            per = tk.Label(t, text="—", bg="#232323", fg=col, font=(self._font, 12, "bold"))
+            per = tk.Label(t, text="—", bg=CARD2, fg=col, font=(self._font, 12, "bold"))
             per.pack(anchor="w")
-            tot = tk.Label(t, text="per hour", bg="#232323", fg=MUTED, font=("Segoe UI", 8))
+            tot = tk.Label(t, text="per hour", bg=CARD2, fg=MUTED, font=("Segoe UI", 8))
             tot.pack(anchor="w")
             self.rate_labels[key] = (per, tot)
         self.acc_box = tk.Frame(lc, bg=CARD)  # one line per account
