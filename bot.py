@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 64  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 65  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1642,19 +1642,6 @@ class Bot:
         self._pre = self._cur  # storage right before this attack
         self.tap(self.hits["attack_button"])
 
-    def keep_builders_busy(self, frame, storage):
-        """'All builders busy': a free builder gets the best upgrade there is (your plan first, else the priciest
-        affordable); if nothing is affordable, attack and look again with more loot."""
-        free = self.free_slots(frame, "builder")
-        if free and time.time() >= self._upgrade_backoff.get("builder", 0):
-            return self.upgrade_from_list("builder")
-        if free == 0 and not getattr(self, "_busy_said", False):
-            self._busy_said = True
-            self.log("All builders busy on this account - farming until one is free.", "ok")
-        elif free:
-            self._busy_said = False
-        self.attack_now()
-
     def open_settings(self, delay=2.0):
         """Settings now lives in the profile window: the player card (top-left) -> its Settings tab."""
         k = self.shot().shape[1] / 1920
@@ -1733,8 +1720,6 @@ class Bot:
                 self.log("Builder Base only: couldn't find the boat - trying again in 2 min.", "warn")
                 self.sleep(120)
             return
-        if self.mode == "busy":  # keep every home builder working on this account: upgrade whenever one is free,
-            return self.keep_builders_busy(frame, storage)  # farm in between. No switching / walls / Builder Base.
         if self.mode == "walls":  # Walls only: farm, and every time the next wall level is affordable, buy it
             if self.maybe_rescan("builder", hours=1):  # keeps the dashboard's wall count current
                 return
@@ -2222,17 +2207,9 @@ class Bot:
     def find_wall_rows(self, frame):
         """'Wall' rows in the open builder list, via Tesseract word search (clean white-on-dark text). Only inside
         the list: a selected wall's own bar says 'Remove Wall' / 'Add Wall', and those must never be tapped."""
-        box = panel_box(frame)
-        if not HAVE_TESS or not box:
-            return []
-        x0, x1, y0, y1 = box
-        gray = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
-        try:
-            d = pytesseract.image_to_data(gray, config="--psm 11", output_type=pytesseract.Output.DICT, timeout=8)
-        except Exception:
-            return []
-        return [(x0 + d["left"][i] + d["width"][i] // 2, y0 + d["top"][i] + d["height"][i] // 2)
-                for i, t in enumerate(d["text"]) if t.strip().lower().startswith("wall")]
+        rows = [r for r in list_rows(frame) if is_wall(r[0])]
+        self._wall_price = {r[3]: (r[1] if r[2] else 10 ** 12) for r in rows}  # unaffordable (red) ones last
+        return [r[3] for r in rows]
 
     def wall_fail(self, why, frame):
         cv2.imwrite(os.path.join(BASE_DIR, "debug_wall.png"), frame)
@@ -2327,11 +2304,8 @@ class Bot:
             self.adb.swipe(cx, box[3] - 60, cx, box[3] - 260, 700)
             self.sleep(1.2)
             rows = self.find_wall_rows(self.shot()) or rows
-        f = self.shot()
-        box = panel_box(f)
-        if box and len(rows) > 1:  # unaffordable prices are red, read as None: those go last
-            rows = sorted(rows, key=lambda r: white_number(f, (box[1] - 200, r[1] - 20, box[1] - 10, r[1] + 20))
-                          or 10 ** 12)
+        if len(rows) > 1:  # the cheapest affordable level first
+            rows = sorted(rows, key=lambda r: self._wall_price.get(r, 10 ** 12))
         self.tap(rows[0], 1.2)
         f = self.shot()
         if panel_box(f):  # the list sometimes stays open over the buttons: its icon closes it
@@ -3373,8 +3347,15 @@ class Bot:
         # 1) a tag seen before  2) the top-left name  3) the Settings window's name  4) the tag itself - a scan
         # never fails just because a name couldn't be read (a fancy name / font / layout on another PC)
         clean = getattr(self, "_settings_name", None)  # the Settings window's big, clean name
+        if clean:  # snap to a known account ('GeoCol2d' -> 'GeoCol2'): same number, close letters
+            near = difflib.get_close_matches(clean, [n for n in self._names if re.sub(r"\D", "", n)
+                                                     == re.sub(r"\D", "", clean)], 1, 0.75)
+            clean = near[0] if near else clean
         last = self._last_name if self._last_name not in (None, "?") else None
-        if not tags.get(data["tag"]) and clean and last and clean != last and self.same_game_name(clean, last):
+        known = {*tags.values(), *(k.split(" (")[0] for k in self.cfg.get("scans") or {}),
+                 *(a["sc"] for a in self.cfg.get("sc_accounts") or [])}
+        if not tags.get(data["tag"]) and clean and last and clean != last and last not in known \
+                and self.same_game_name(clean, last):
             if last in self._names:  # first time this account is seen: the top-left read slipped ('GecCol' for
                 self._names.remove(last)  # 'GeoCol') - file it under the clean name, and snap future reads to it
             self._names.append(clean)
@@ -3917,8 +3898,8 @@ class Bot:
 # Phone view: read-only web page (live screen + stats), shared through the Anywhere link
 # ---------------------------------------------------------------------------
 PHONE_PAGE = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#141414"><title>Loot Farmer</title><style>
-*{box-sizing:border-box}body{margin:0;background:#1c1c1c;color:#e6e6e6;font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
+<meta name="theme-color" content="#121418"><title>Loot Farmer</title><style>
+*{box-sizing:border-box}body{margin:0;background:#121418;color:#e9e9ec;font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
 .wrap{max-width:760px;margin:0 auto;padding:14px}
 header{display:flex;align-items:center;gap:10px;margin-bottom:12px}header img{height:42px}
 h1{font-size:19px;margin:0}.sub{color:#9a9a9a;font-size:12px}
@@ -3928,13 +3909,13 @@ white-space:nowrap;max-width:46%;overflow:hidden;text-overflow:ellipsis}
 #f{width:100%;border-radius:12px;background:#141414;min-height:140px;display:block}
 .row{display:grid;gap:8px;margin:10px 0}.r3{grid-template-columns:repeat(3,1fr)}.r2{grid-template-columns:repeat(2,1fr)}
 .r4{grid-template-columns:repeat(4,1fr)}
-.c{background:#2b2b2b;border-radius:12px;padding:10px;display:flex;align-items:center;gap:8px;min-width:0}
+.c{background:#1c1f26;border:1px solid #262a33;border-radius:14px;padding:10px;display:flex;align-items:center;gap:8px;min-width:0}
 .c img{height:28px;flex:none}.c .v{font-weight:700;font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .c .l{color:#9a9a9a;font-size:11px;text-transform:uppercase;letter-spacing:.03em}
 .s{flex-direction:column;align-items:flex-start;gap:2px;padding:8px 10px}.s .v{font-size:16px}
 .gold{color:#f5c542}.elixir{color:#d77bff}.dark{color:#b9a3ff}
 h2{font-size:12px;color:#9a9a9a;text-transform:uppercase;letter-spacing:.05em;margin:16px 2px 6px}
-.card{background:#2b2b2b;border-radius:12px;padding:10px 12px}
+.card{background:#1c1f26;border:1px solid #262a33;border-radius:14px;padding:10px 12px}
 .acc{display:flex;align-items:center;gap:6px;padding:6px 0;border-bottom:1px solid #353535;flex-wrap:wrap}.acc:last-child{border:0}
 .acc b{flex:1 1 100%;font-size:14px}.acc span{display:flex;align-items:center;gap:3px;font-weight:600;font-size:13px;margin-right:8px}
 .acc img{height:16px}
@@ -3942,8 +3923,11 @@ h2{font-size:12px;color:#9a9a9a;text-transform:uppercase;letter-spacing:.05em;ma
 .wall .n{color:#f5c542;font-weight:600;font-size:13px}.wall .ok{color:#4cc38a;font-weight:600;font-size:13px}
 .wall .m{color:#9a9a9a;font-size:12px}
 .ctl{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
-.ctl select,.ctl button{font:inherit;font-size:14px;border:0;border-radius:10px;padding:10px 12px;background:#3a3a3a;color:#e6e6e6}
-.ctl select{flex:1 1 140px}.ctl .go{background:#2f7d55;font-weight:700;min-width:90px}.ctl .go.stop{background:#a33a3a}
+.ctl select,.ctl button{font:inherit;font-size:14px;border:0;border-radius:10px;padding:10px 12px;background:#2a2f3a;color:#e9e9ec}
+.ctl select{flex:1 1 140px}.ctl .go{background:#f5c542;color:#1b1405;font-weight:800;min-width:96px}
+.ctl .go.stop{background:#a33a3a;color:#fff}
+.opts{display:flex;flex-wrap:wrap;gap:6px 16px;flex-basis:100%;font-size:14px}.opts label{display:flex;align-items:center;gap:6px}
+.opts input{width:18px;height:18px;accent-color:#f5c542}
 .ctl #cmsg{flex-basis:100%;color:#9a9a9a;font-size:12px}
 #log{background:#141414;border-radius:12px;padding:10px;font:12px ui-monospace,Consolas,monospace;white-space:pre-wrap;
 max-height:260px;overflow:auto}
@@ -3953,6 +3937,8 @@ max-height:260px;overflow:auto}
 <div class="pill idle" id="state">&hellip;</div></header>
 <img id="f" alt="">
 <div class="card ctl"><select id="m"></select><button id="go" class="go">Start</button>
+<div class="opts" id="opts"><label><input type="checkbox" id="o_rotate_accounts">Switch accounts when all busy</label>
+<label><input type="checkbox" id="o_builder_base_enabled">Visit the Builder Base</label></div>
 <select id="pz"><option value="">Pause&hellip;</option><option value="15">15 min</option><option value="30">30 min</option>
 <option value="60">1 hour</option><option value="120">2 hours</option></select><button id="rg">Restart game</button>
 <select id="acc"></select><button id="sw">Switch account</button>
@@ -3971,27 +3957,31 @@ async function cmd(o){$("cmsg").textContent="Sending…";try{const r=await fetch
 headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});$("cmsg").textContent=(await r.json()).msg||"";}
 catch(e){$("cmsg").textContent="PC not reachable.";}setTimeout(tick,600);}
 $("go").onclick=()=>RUN?confirm("Stop farming?")&&cmd({action:"stop"}):cmd({action:"start",mode:$("m").value});
-$("m").onchange=()=>{if(RUN&&$("m").value!==MODE){confirm("Switch to "+$("m").selectedOptions[0].text+"?")?
+$("m").onchange=()=>{$("opts").style.display=$("m").value==="farm"?"flex":"none";if(RUN&&$("m").value!==MODE){confirm("Switch to "+$("m").selectedOptions[0].text+"?")?
 cmd({action:"start",mode:$("m").value}):($("m").value=MODE);}};
 $("pz").onchange=()=>{const v=$("pz").value;$("pz").value="";if(v&&confirm("Pause for "+v+" minutes?"))cmd({action:"pause",minutes:+v});};
 $("rg").onclick=()=>confirm("Restart Clash of Clans?")&&cmd({action:"restart_game"});
 $("sw").onclick=()=>{const a=$("acc").value;if(!a)return cmd({action:"load_accounts"});
 if(confirm("Switch to "+a+"?"))cmd({action:"switch_account",account:a});};
 const STATS=[["runtime","Runtime"],["attacks","Attacks","king"],["walls","Walls","wall"],["upgrades","Upgrades","hammer"],
-["switches","Switches","builder_icon"],["skipped","Skipped","shield"],["recoveries","Restarts"],["battery","Battery"]];
+["switches","Switches","builder_icon"],["skipped","Skipped","shield"],["errors","Errors"],["battery","Battery"]];
+for(const k of ["rotate_accounts","builder_base_enabled"])$("o_"+k).onchange=e=>cmd({action:"set_option",key:k,value:e.target.checked});
 async function tick(){try{const s=await (await fetch("status"+Q,{cache:"no-store"})).json();
 const st=$("state");st.textContent=s.state;st.className="pill"+(/idle|stopped/i.test(s.state)?" idle":/recover/i.test(s.state)?" off":"");
 $("mode").textContent=s.mode?"Mode: "+s.mode:"";
-if(s.modes&&!$("m").options.length)$("m").innerHTML=s.modes.map(([k,l])=>`<option value="${k}">${l}</option>`).join("");
+if(s.modes&&!$("m").options.length)$("m").innerHTML=s.modes.map(([v,ms])=>`<optgroup label="${v}">`+
+ms.map(([k,l])=>`<option value="${k}">${l}</option>`).join("")+"</optgroup>").join("");
+const O=s.options||{};for(const k in O)if(document.activeElement!==$("o_"+k))$("o_"+k).checked=O[k];
 const A=s.accounts||[];if($("acc").options.length!==(A.length||1))$("acc").innerHTML=A.length?
 A.map(([k,l])=>`<option value="${k}">${l}</option>`).join(""):'<option value="">No accounts saved yet</option>';
 $("sw").textContent=A.length?"Switch account":"Load accounts";if(s.current_acc&&document.activeElement!==$("acc"))$("acc").value=s.current_acc;
 RUN=!!s.running;MODE=s.mode_key||"";if(document.activeElement!==$("m"))$("m").value=MODE;
+$("opts").style.display=$("m").value==="farm"?"flex":"none";
 $("go").textContent=RUN?"Stop":"Start";$("go").className="go"+(RUN?" stop":"");
 if(s.resume_in>0)$("cmsg").textContent="Paused - starts again in "+Math.ceil(s.resume_in/60)+" min.";
 const B=s.bb,I=k=>B&&k!="dark"?"b"+k:k;$("rates").className="row "+(B?"r2":"r3");
 const R=s.rates||{};$("rates").innerHTML=[["gold","gold"],["elixir","elixir"]].concat(B?[]:[["dark","dark"]]).map(([k,c])=>
-`<div class="c"><img src="${ic(I(k))}"><div style="min-width:0"><div class="v ${c}">${((R[k]||["—"])[0]).replace(" / h","").replace(/(\\.\\d)\\dM/,"$1M")}</div><div class="l">per hour</div><div class="l" style="text-transform:none">${((R[k]||["",""])[1]).replace(" this session"," total")}</div></div></div>`).join("");
+`<div class="c"><img src="${ic(I(k))}"><div style="min-width:0"><div class="v ${c}">${((R[k]||["—"])[0]).replace(" / h","").replace(/(\\.\\d)\\dM/,"$1M")}</div><div class="l">per hour</div><div class="l" style="text-transform:none">${((R[k]||["",""])[1])}</div></div></div>`).join("");
 $("store").innerHTML=[["s_gold","gold","gold"],["s_elixir","elixir","elixir"]].map(([k,i,c])=>
 `<div class="c"><img src="${ic(I(i))}"><div class="v ${c}">${s[k]??"—"}</div></div>`).join("");
 $("g").innerHTML=STATS.map(([k,l,i])=>`<div class="c s"><div class="l">${i?`<img src="${ic(i)}" style="height:14px;vertical-align:-2px"> `:""}${l}</div><div class="v">${s[k]??"-"}</div></div>`).join("");
@@ -4004,7 +3994,8 @@ $("f").src="frame.jpg"+Q+"&t="+Date.now();}catch(e){const st=$("state");st.textC
 tick();setInterval(tick,1500);</script></body></html>"""
 
 
-PHONE_ACTIONS = ("start", "stop", "pause", "restart_game", "switch_account", "load_accounts")
+PHONE_ACTIONS = ("start", "stop", "pause", "restart_game", "switch_account", "load_accounts", "set_option")
+PHONE_OPTIONS = ("rotate_accounts", "builder_base_enabled")  # the only settings the phone can change
 
 
 class PhoneView:
@@ -4535,13 +4526,16 @@ def battery():
 # ---------------------------------------------------------------------------
 BG, CARD, MUTED, TEXT = "#1c1c1c", "#2b2b2b", "#9a9a9a", "#e6e6e6"
 SIDE, NAV_ON = "#141414", "#262b33"  # sidebar, selected page
-# what the mode picker shows: mode -> (title, one line, icon in wiki/ui)
-MODES = {"farm": ("Full farm", "Attacks + upgrades", "king"), "loot": ("Loot only", "Just attack", "gold"),
-         "walls": ("Walls only", "Farm + buy walls", "wall"),
-         "busy": ("All builders busy", "This account, home base", "hammer"),
-         "bb_loot": ("BB loot", "Builder Base attacks", "bgold"),
-         "bb_farm": ("BB farm", "BB upgrades", "builderhall"),
-         "bb_walls": ("BB walls", "Builder Base walls", "wall")}
+# what the mode picker shows: mode -> (name, what it does, icon in wiki/ui), grouped by village
+MODES = {"farm": ("Farm & Upgrade", "Attacks and keeps every builder, the lab and pets busy.", "king"),
+         "loot": ("Attack Only", "Just attacks on this account - no upgrades, walls or switching.", "gold"),
+         "walls": ("Walls", "Farms and spends the storages on walls.", "wall"),
+         "bb_farm": ("Farm & Upgrade", "Builder Base attacks + upgrades (Star Lab, Clock Tower boost, cart).",
+                     "builderhall"),
+         "bb_loot": ("Attack Only", "Builder Base attacks only - daily stars and loot.", "bgold"),
+         "bb_walls": ("Walls", "Builder Base walls: farms and buys them.", "wall")}
+VILLAGES = (("Home Village", ("farm", "loot", "walls")), ("Builder Base", ("bb_farm", "bb_loot", "bb_walls")))
+mode_name = lambda m: f"{MODES[m][0]} · {'Builder Base' if m.startswith('bb_') else 'Home Village'}"
 GREEN, AMBER, RED, BLUE, GOLD, PINK = "#4cc38a", "#e5b454", "#ff6b6b", "#57a6ff", "#f5c542", "#d77bff"
 LEVEL_COLORS = {"info": TEXT, "ok": GREEN, "warn": AMBER, "err": RED}
 UI_SCALE = 1.0  # set from the real DPI at startup so the layout isn't tiny on 150-200% displays
@@ -5296,29 +5290,56 @@ class App(tk.Tk):
         main.pack(side="left", fill="both", expand=True)
         top = ttk.Frame(main, padding=S(20, 16, 20, 4))
         top.pack(fill="x")
-        self.start_btn = ttk.Button(top, text="▶  Start", style="Start.Accent.TButton", width=12,
-                                    command=lambda: self.toggle(self.mode_var.get()))
-        self.start_btn.pack(side="right", fill="y", padx=S(14, 0))
+        self.start_btn = tk.Label(top, text="▶  Start", bg=GOLD, fg="#1b1405", cursor="hand2",
+                                  font=(self._font, 13, "bold"), padx=S(24), pady=S(12))
+        self.start_btn.pack(side="right", fill="y", padx=S(16, 0))
+        self.start_btn.bind("<Button-1>", lambda e: self.start_btn.cget("state") != "disabled"
+                            and self.toggle(self.mode_var.get()))
+        self.start_btn.bind("<Enter>", lambda e: self.start_btn.config(bg="#ffd56b"))
+        self.start_btn.bind("<Leave>", lambda e: self.start_btn.config(bg=GOLD))
         modes = tk.Frame(top, bg=BG)
         modes.pack(side="left", fill="x", expand=True)
         self.mode_var = tk.StringVar(value=self.cfg.get("ui_mode") if self.cfg.get("ui_mode") in MODES else "farm")
+        # ('busy' - 'All Builders Busy' - was Farm & Upgrade with account switching off: falls back to 'farm')
         self.mode_cards = {}
-        for i, (m, (title, sub, icon)) in enumerate(MODES.items()):
-            modes.columnconfigure(i, weight=1, uniform="m")
-            card = tk.Frame(modes, bg=CARD, cursor="hand2", padx=S(6), pady=S(6), highlightthickness=S(2),
-                            highlightbackground=CARD, highlightcolor=CARD)
-            card.grid(row=0, column=i, sticky="nsew", padx=S(0 if i == 0 else 8, 0))
-            ic = tk.Label(card, image=self.ui_icon(icon, S(32)), bg=CARD)
-            ic.pack()
-            t = tk.Frame(card, bg=CARD)
-            t.pack(fill="x")
-            l1 = tk.Label(t, text=title, bg=CARD, fg=TEXT, font=("Segoe UI", 10, "bold"))
-            l1.pack()
-            l2 = tk.Label(t, text=sub, bg=CARD, fg=MUTED, font=("Segoe UI", 8))
-            l2.pack()
-            for w in (card, ic, t, l1, l2):
-                w.bind("<Button-1>", lambda e, m=m: self.pick_mode(m))
-            self.mode_cards[m] = card
+        for gi, (village, ms) in enumerate(VILLAGES):  # one row per village: its modes as pills
+            row = tk.Frame(modes, bg=BG)
+            row.pack(fill="x", pady=S(0 if gi == 0 else 6, 0))
+            tk.Label(row, text=village.upper(), bg=BG, fg=MUTED, font=("Segoe UI", 8, "bold"), width=13,
+                     anchor="w").pack(side="left")
+            for m in ms:
+                title, _, icon = MODES[m]
+                pill = tk.Frame(row, bg=CARD, cursor="hand2", padx=S(8), pady=S(4), highlightthickness=S(2),
+                                highlightbackground=CARD, highlightcolor=CARD)
+                pill.pack(side="left", padx=S(0, 5))
+                ic = tk.Label(pill, image=self.ui_icon(icon, S(20)), bg=CARD)
+                ic.pack(side="left")
+                tx = tk.Label(pill, text=title, bg=CARD, fg=TEXT, font=("Segoe UI", 9, "bold"))
+                tx.pack(side="left", padx=S(6, 0))
+                for w in (pill, ic, tx):
+                    w.bind("<Button-1>", lambda e, m=m: self.pick_mode(m))
+                self.mode_cards[m] = pill
+        self.mode_desc = tk.Label(modes, text="", bg=BG, fg=MUTED, font=("Segoe UI", 9), anchor="w")
+        self.mode_desc.pack(fill="x", pady=S(6, 0))
+        # Farm & Upgrade's two choices, right where the mode is picked (same settings as on the Settings page)
+        self.opt_row, self.opt_vars = tk.Frame(modes, bg=BG), {}
+        for key, label, on, off in (
+                ("rotate_accounts", "Switch accounts when this one is all busy",
+                 "Account switching on: when every builder and the lab are busy, the next account takes over.",
+                 "Account switching off: stays on this account (keeps its builders busy, farming in between)."),
+                ("builder_base_enabled", "Visit the Builder Base",
+                 "Builder Base on: each account gets a visit (collect, cart, upgrades, daily stars).",
+                 "Builder Base off.")):
+            v = self.opt_vars[key] = tk.BooleanVar(value=bool(self.cfg[key]))
+
+            def flip(key=key, v=v, on=on, off=off):
+                self.cfg[key] = v.get()  # the running bot shares this dict: takes effect at once
+                if key in getattr(self, "svars", {}):
+                    self.svars[key][0].set(v.get())
+                save_config(self.cfg)
+                self.log(on if v.get() else off, "ok")
+            ttk.Checkbutton(self.opt_row, text=label, variable=v, command=flip,
+                            style="Switch.TCheckbutton").pack(side="left", padx=S(0, 18))
         self.pick_mode(self.mode_var.get(), save=False)
 
         nb = self.nb = ttk.Notebook(main, style="Hidden.TNotebook")  # pages; the sidebar is the tab row
@@ -5340,15 +5361,20 @@ class App(tk.Tk):
         self.mode_var.set(m)
         for k, card in self.mode_cards.items():
             on = k == m
-            card.config(highlightbackground=BLUE if on else CARD, highlightcolor=BLUE if on else CARD)
-        self.start_btn.config(text="▶  Start")
+            card.config(highlightbackground=GOLD if on else CARD, highlightcolor=GOLD if on else CARD)
+        self.mode_desc.config(text=f"{mode_name(m)}  —  {MODES[m][1]}")
+        if m == "farm":
+            self.opt_row.pack(fill="x", pady=S(6, 0))
+        else:
+            self.opt_row.pack_forget()
+        self.start_btn.config(text="▶  Start", bg=GOLD, state="normal")
         if save and self.cfg.get("ui_mode") != m:
             self.cfg["ui_mode"] = m
             save_config(self.cfg)
 
     def _build_dashboard(self, tab):
-        tab.columnconfigure(0, weight=3)
-        tab.columnconfigure(1, weight=2)
+        tab.columnconfigure(0, weight=1, uniform="dash")  # uniform: the live view keeps its half whatever the
+        tab.columnconfigure(1, weight=1, uniform="dash")  # numbers on the right need
         tab.rowconfigure(1, weight=1, minsize=S(200))  # the live view never gets squeezed out
         stats = ttk.Frame(tab)
         stats.grid(row=0, column=0, columnspan=2, sticky="ew", pady=S(0, 10))
@@ -5358,34 +5384,22 @@ class App(tk.Tk):
                                                 ("upgrades", "Upgrades", "hammer"), ("switches", "Switches", "builder_icon"),
                                                 ("recoveries", "Restarts", "battlemachine"), ("errors", "Errors", None)]):
             stats.columnconfigure(i, weight=1, uniform="s")
-            c = tk.Frame(stats, bg=CARD, padx=S(12), pady=S(8))
+            c = tk.Frame(stats, bg=CARD, padx=S(10), pady=S(8))
             c.grid(row=0, column=i, sticky="nsew", padx=S(0 if i == 0 else 6, 0))
-            t = c
-            hd = tk.Frame(c, bg=CARD)
-            hd.pack(anchor="w")
+            tk.Label(c, text=title.upper(), bg=CARD, fg=MUTED, font=("Segoe UI", 7, "bold")).pack(anchor="w")
+            v = tk.Frame(c, bg=CARD)
+            v.pack(anchor="w", pady=S(2, 0))
             if icon:
-                tk.Label(hd, image=self.ui_icon(icon, S(20)), bg=CARD).pack(side="left", padx=S(0, 5))
-            tk.Label(hd, text=title.upper(), bg=CARD, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
-            self.stat_labels[key] = tk.Label(t, text="0" if key != "runtime" else "—", bg=CARD, fg=TEXT,
-                                             font=(self._font, 17, "bold"))
-            self.stat_labels[key].pack(anchor="w")
+                tk.Label(v, image=self.ui_icon(icon, S(22)), bg=CARD).pack(side="left", padx=S(0, 6))
+            self.stat_labels[key] = tk.Label(v, text="0" if key != "runtime" else "—", bg=CARD,
+                                             fg=RED if key == "errors" else TEXT, font=(self._font, 16, "bold"))
+            self.stat_labels[key].pack(side="left")
 
         live = self.card(tab, "Live view", row=1, column=0, padx=S(0, 6))
         top = ttk.Frame(live, style="Card.TFrame")
         top.pack(fill="x", pady=S(0, 8))
         self.state_label = ttk.Label(top, text="Idle", style="Big.TLabel", foreground=MUTED)
         self.state_label.pack(side="left")
-        self.bb_var = tk.BooleanVar(value=bool(self.cfg["builder_base_enabled"]))
-
-        def bb_toggled():
-            self.cfg["builder_base_enabled"] = self.bb_var.get()  # the running bot shares this dict: live
-            if "builder_base_enabled" in getattr(self, "svars", {}):
-                self.svars["builder_base_enabled"][0].set(self.bb_var.get())
-            save_config(self.cfg)
-            self.log("Builder Base " + ("on: each account gets a visit (collect, cart, upgrades, daily stars)."
-                                        if self.bb_var.get() else "off."), "ok")
-        ttk.Checkbutton(top, text="Full farm visits the Builder Base", variable=self.bb_var, command=bb_toggled,
-                        style="Switch.TCheckbutton").pack(side="right")
         self.preview = tk.Canvas(live, bg="#141414", highlightthickness=0, height=S(240))
         self.preview.pack(fill="both", expand=True)
         self.preview.create_text(10, 10, anchor="nw", text="The emulator screen appears here while farming.",
@@ -5416,15 +5430,15 @@ class App(tk.Tk):
         for i, (key, col, icon) in enumerate([("gold", GOLD, "gold"), ("elixir", PINK, "elixir"),
                                               ("dark", "#b9a3ff", "dark")]):
             rates.columnconfigure(i, weight=1, uniform="rt")
-            cell = self.rate_cells[key] = tk.Frame(rates, bg="#232323", padx=S(10), pady=S(8))
+            cell = self.rate_cells[key] = tk.Frame(rates, bg="#232323", padx=S(8), pady=S(8))
             cell.grid(row=0, column=i, sticky="nsew", padx=S(0 if i == 0 else 6, 0))
-            self.rate_icons[key] = tk.Label(cell, image=self.ui_icon(icon, S(30)), bg="#232323")
+            self.rate_icons[key] = tk.Label(cell, image=self.ui_icon(icon, S(24)), bg="#232323")
             self.rate_icons[key].pack(side="left", padx=S(0, 8))
             t = tk.Frame(cell, bg="#232323")
             t.pack(side="left")
-            per = tk.Label(t, text="—", bg="#232323", fg=col, font=(self._font, 15, "bold"))
+            per = tk.Label(t, text="—", bg="#232323", fg=col, font=(self._font, 12, "bold"))
             per.pack(anchor="w")
-            tot = tk.Label(t, text="per hour", bg="#232323", fg=MUTED, font=("Segoe UI", 9))
+            tot = tk.Label(t, text="per hour", bg="#232323", fg=MUTED, font=("Segoe UI", 8))
             tot.pack(anchor="w")
             self.rate_labels[key] = (per, tot)
         self.acc_box = tk.Frame(lc, bg=CARD)  # one line per account
@@ -5566,8 +5580,9 @@ class App(tk.Tk):
             c.columnconfigure(1, weight=1)
             ttk.Label(c, text=group, style="Big.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
             if blurb:
-                ttk.Label(c, text=blurb, style="Muted.TLabel", wraplength=S(470)).grid(
-                    row=1, column=0, columnspan=2, sticky="w", pady=S(0, 8))
+                bl = ttk.Label(c, text=blurb, style="Muted.TLabel", wraplength=S(400))
+                bl.grid(row=1, column=0, columnspan=2, sticky="w", pady=S(0, 8))
+                c.bind("<Configure>", lambda e, bl=bl: bl.config(wraplength=max(S(200), e.width - S(40))), add="+")
             for r, (key, label, kind) in enumerate(fields, start=2):
                 if kind is bool:
                     v = tk.BooleanVar()
@@ -5672,13 +5687,14 @@ class App(tk.Tk):
             st["walls_view"] = getattr(self, "walls_view", [])
             st["running"] = bool(self.thread)
             st["mode_key"] = self.bot.mode if self.bot else self.mode_var.get()
-            st["modes"] = [[k, v[0]] for k, v in MODES.items()]
+            st["modes"] = [[v, [[k, MODES[k][0]] for k in ms]] for v, ms in VILLAGES]
+            st["options"] = {k: bool(self.cfg[k]) for k in PHONE_OPTIONS}
             st["resume_in"] = max(0, int(self._resume[0] - time.time())) if self._resume else 0
             st["accounts"] = [[a["sc"], a["sc"] + (f" - {a['game']}" if a.get("game") else "")
                                + (f" (TH{a['th']})" if a.get("th") else "")] for a in self.cfg.get("sc_accounts") or []]
             st["current_acc"] = getattr(self.bot, "_cur_sc", None) if self.bot else None
             st["bb"] = self.bb_view
-            st["mode"] = MODES[self.bot.mode if self.bot else self.mode_var.get()][0]
+            st["mode"] = mode_name(self.bot.mode if self.bot else self.mode_var.get())
             st.update(state=self.state_label.cget("text"), log=list(self.recent))
             self.phone.status = st
         if self.started_at:
@@ -5816,7 +5832,7 @@ class App(tk.Tk):
             if miss:
                 return self.log("📱 Phone: can't start - finish Setup first (" + "; ".join(miss) + ").", "warn")
             self.pick_mode(mode, save=False)
-            self.log(f"📱 Phone: start ({MODES[mode][0]}).", "ok")
+            self.log(f"📱 Phone: start ({mode_name(mode)}).", "ok")
         self.reset_dashboard()
         self.bot = Bot(self.cfg, self.adb, self.emit, mode)
         self.thread = threading.Thread(target=self.bot.run, daemon=True)
@@ -5851,7 +5867,7 @@ class App(tk.Tk):
                 return self.log("📱 Phone: already farming.")
             self._resume = (time.time(), mode)  # starts as soon as the bot is stopped (now, if it isn't running)
             if running:
-                self.log(f"📱 Phone: switching to {MODES[mode][0]}.", "ok")
+                self.log(f"📱 Phone: switching to {mode_name(mode)}.", "ok")
                 self.bot.stop_evt.set()
         elif a == "stop":
             self._resume = None
@@ -5880,6 +5896,17 @@ class App(tk.Tk):
                 self.start_bot(mode, "phone")
             if self.bot:
                 self.bot.switch_req = sc
+        elif a == "set_option":
+            key = c.get("key")
+            if key not in PHONE_OPTIONS or not isinstance(c.get("value"), bool):
+                return self.log("📱 Phone: that setting can't be changed from the phone.", "warn")
+            self.opt_vars[key].set(c["value"])
+            self.cfg[key] = c["value"]  # the running bot shares this dict: takes effect at once
+            if key in getattr(self, "svars", {}):
+                self.svars[key][0].set(c["value"])
+            save_config(self.cfg)
+            self.log(f"📱 Phone: {'switch accounts' if key == 'rotate_accounts' else 'visit the Builder Base'} "
+                     f"{'on' if c['value'] else 'off'}.", "ok")
         elif a == "restart_game":
             if running:
                 self.log("📱 Phone: restart the game.", "ok")
@@ -5920,7 +5947,7 @@ class App(tk.Tk):
         for i, key in enumerate(("gold", "elixir", "dark")):
             per, total = self.rate_labels[key]
             per.config(text=f"{rate(tot[i])} / h" if hrs and rows else "—")
-            total.config(text=f"{short(tot[i])} this session" if rows else "per hour")
+            total.config(text=f"{short(tot[i])} total" if rows else "per hour")
         for w in self.acc_box.winfo_children():
             w.destroy()
         if not rows:
@@ -6213,8 +6240,8 @@ class App(tk.Tk):
                 messagebox.showerror("Invalid value", f"'{label}' needs a number.")
                 return
         self.cfg.update(new)
-        if hasattr(self, "bb_var"):
-            self.bb_var.set(bool(self.cfg["builder_base_enabled"]))
+        for key, v in getattr(self, "opt_vars", {}).items():
+            v.set(bool(self.cfg[key]))
         self.adb.path = self.cfg["adb_path"]
         if HAVE_TESS:
             pytesseract.pytesseract.tesseract_cmd = self.cfg["tesseract_path"]
