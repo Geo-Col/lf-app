@@ -76,7 +76,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 69  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 70  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -4069,7 +4069,8 @@ class PhoneView:
                     return
                 try:
                     cmd = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 2000)))
-                    ok = isinstance(cmd, dict) and cmd.get("action") in PHONE_ACTIONS
+                    ok = isinstance(cmd, dict) and cmd.get("action") in PHONE_ACTIONS and (cmd["action"] != "set_option" or (
+                        cmd.get("key") in PHONE_OPTIONS and isinstance(cmd.get("value"), bool)))
                 except (ValueError, TypeError):
                     ok = False
                 if ok:
@@ -4367,6 +4368,38 @@ def process_running(exe):
     return os.path.basename(exe).lower() in out.lower()
 
 
+def get_cloudflared(exe):
+    """Download cloudflared (Cloudflare's own release on GitHub) and keep it only if Windows says it's validly
+    signed by Cloudflare - the same check Setup does. True when it's in place."""
+    url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+    tmp = exe + ".download"
+    log_file.info("cloudflared.exe is missing (needed for the Anywhere link) - downloading it from Cloudflare.")
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "LootFarmer"}),
+                                    timeout=120) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f)
+        ps = ("$s = Get-AuthenticodeSignature -LiteralPath $env:LF_EXE; "
+              "if ($s.Status -eq 'Valid' -and $s.SignerCertificate.Subject -like '*Cloudflare*') { 'ok' }")
+        ok = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True,
+                            timeout=60, creationflags=NO_WINDOW, env=dict(os.environ, LF_EXE=tmp)).stdout.strip()
+        if ok != "ok":
+            os.remove(tmp)
+            log_file.warning("The downloaded cloudflared.exe isn't signed by Cloudflare - deleted it. The Anywhere "
+                             "link stays off.")
+            return False
+        os.replace(tmp, exe)
+        log_file.info("cloudflared.exe downloaded (signed by Cloudflare).")
+        return True
+    except Exception as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        log_file.warning(f"Couldn't download cloudflared.exe ({e}) - the Anywhere link stays off. Run Setup.bat to "
+                         "install it, or check that antivirus isn't removing it.")
+        return False
+
+
 def post_discord(cfg, text, files=()):
     """Best effort: a failed post is logged, never raised. files: [(filename, bytes)], up to 10."""
     hook = cfg.get("discord_webhook") or ""
@@ -4375,8 +4408,9 @@ def post_discord(cfg, text, files=()):
             hook = base64.b64decode(hook).decode()
         except Exception:
             return
-    if not hook.startswith("https://discord.com/api/webhooks/"):
-        return
+    if not re.match(r"https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/api/webhooks/", hook):
+        log_file.warning("The Discord webhook in Settings doesn't look like a Discord webhook link.")
+        return False
     payload = json.dumps({"content": text[:1900]})
     if files:  # multipart: the message as payload_json + each file as files[i]
         b = "----LootFarmer" + secrets.token_hex(8)
@@ -4398,7 +4432,7 @@ def post_discord(cfg, text, files=()):
         except urllib.error.HTTPError as e:
             if e.code not in (429, 500, 502, 503, 504):
                 log_file.warning(f"Discord post refused: {e}")
-                return
+                return False  # the webhook itself is wrong (deleted / mistyped): retrying won't help
             wait = 5 * (i + 1)
             try:
                 wait = float(json.loads(e.read()).get("retry_after", wait)) + 1
@@ -5329,8 +5363,20 @@ class App(tk.Tk):
             try:
                 self.phone = PhoneView(port, key, lambda cmd: self.emit("phone_cmd", cmd))
                 exe = os.path.join(BASE_DIR, "cloudflared.exe")
+                start = lambda: Tunnel(exe, port, lambda url: self.ui(lambda: self._public_url(url)))
                 if self.cfg["public_link_enabled"] and os.path.isfile(exe):
-                    self.tunnel = Tunnel(exe, port, lambda url: self.ui(lambda: self._public_url(url)))
+                    self.tunnel = start()
+                elif self.cfg["public_link_enabled"]:  # Setup skipped, or antivirus removed it: fetch it now
+                    self.tunnel = True  # (the label says 'starting'; the real Tunnel once it's downloaded)
+
+                    def fetch():
+                        if get_cloudflared(exe):
+                            self.tunnel = start()
+                        else:
+                            self.tunnel = None
+                            self.ui(lambda: self.public_label.config(text="🌍  Anywhere link: off (see log)",
+                                                                    foreground=MUTED))
+                    threading.Thread(target=fetch, daemon=True).start()
                 else:
                     Tunnel.kill_saved()
             except OSError as e:
@@ -5974,8 +6020,12 @@ class App(tk.Tk):
             for i in range(60):
                 if my != self._announce_id:
                     return  # superseded by a newer link / start message
-                if post_discord(self.cfg, text):
+                sent = post_discord(self.cfg, text)
+                if sent:
                     return self.log("Anywhere link sent to Discord.", "ok")
+                if sent is False:
+                    return self.log("Discord refused the Anywhere link - the webhook in Settings is wrong or was "
+                                    "deleted (blank it to use the built-in one).", "err")
                 if i == 0:
                     self.log("Couldn't reach Discord to send the Anywhere link - retrying every minute.", "warn")
                 time.sleep(60)
