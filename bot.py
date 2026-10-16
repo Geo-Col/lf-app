@@ -76,7 +76,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 71  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 72  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1631,6 +1631,7 @@ class Bot:
         pre, self._pre = self._pre, None
         if pre and pre[0] == name and None not in now[:2] and None not in pre[1][:2]:
             gain = [max(0, (n or 0) - (p or 0)) if n is not None and p is not None else 0 for n, p in zip(now, pre[1])]
+            self.note_full(name, gain[:2])
             if any(gain) and max(gain) <= 20_000_000:  # sanity: no single attack brings more
                 row = self.loot.setdefault(name, [0, 0, 0, 0])
                 for i, g in enumerate(gain):
@@ -1640,6 +1641,22 @@ class Bot:
                 self.log(f"{name}: +{gain[0]:,} gold, +{gain[1]:,} elixir, +{gain[2]:,} dark")
         self._cur = (name, now)
         return storage
+
+    def note_full(self, name, gain):
+        """After an attack: a storage that gained under 10% of what the base offered (300k+) is full. Two such
+        attacks in a row for both gold and elixir = this account's storages are full (one can be a bad attack)."""
+        offered, self._offered = getattr(self, "_offered", None), None
+        if not offered or None in offered:
+            return
+        full = all(o >= 300_000 and g < o * 0.1 for g, o in zip(gain, offered))
+        hits = self.__dict__.setdefault("_full_hits", {})
+        hits[name] = hits.get(name, 0) + 1 if full else 0
+        if full:
+            self.log(f"{name}: storages look full (gained {gain[0]:,} gold / {gain[1]:,} elixir of "
+                     f"{offered[0]:,} / {offered[1]:,} offered).")
+
+    def storages_full(self, name):
+        return self.__dict__.get("_full_hits", {}).get(name, 0) >= 2
 
     def attack_now(self):
         self._pre = self._cur  # storage right before this attack
@@ -1716,6 +1733,18 @@ class Bot:
             if self.scan_export():
                 return
         storage = self.track_loot(frame, self.read_storage(frame))
+        if self.mode == "loot_rotate":  # Attack & Switch: farm this account until its storages are full, then
+            name = self._last_name or "?"  # the next account; when every account is full, stop
+            if self.storages_full(name):
+                self.log(f"{name}: gold and elixir storages are full - switching to the next account.", "ok")
+                self._full_done = getattr(self, "_full_done", set()) | {getattr(self, "_cur_sc", None) or name}
+                if self._n_accounts and len(self._full_done) >= self._n_accounts:
+                    self.log("Every account's storages are full - nothing left to farm. Stopping.", "ok")
+                    self.stop_evt.set()
+                    raise Abort()
+                if self.switch_account(full_rotation=True):
+                    return
+            return self.attack_now()
         if self.mode == "loot":  # Loot only: no upgrades, walls or account switching - just attack
             return self.attack_now()
         if self.mode.startswith("bb_"):  # Builder Base only: never stays home
@@ -1962,6 +1991,7 @@ class Bot:
 
     # --- attacking ---
     def attack(self, gold, elixir):
+        self._offered = (gold, elixir)  # what the base had: a storage that then barely rises is full
         loot = f" - gold {gold:,} / elixir {elixir:,}" if gold is not None and elixir is not None else ""
         self.log(f"Attacking{loot}", "ok")
         self.bump("attacks")
@@ -2130,14 +2160,17 @@ class Bot:
 
     # --- walls ---
     def walls_progress(self, paid):
-        """Walls just bought: move that many of the lowest walls up a level in this account's scan, so the
-        dashboard's Walls card is current without waiting for the next export (price / one wall = how many)."""
+        """Walls just bought: move them up a level in this account's scan, so the dashboard's Walls card is current
+        without waiting for the next export. Which level: the one whose upgrade costs what one wall cost."""
         sd = ((self.cfg.get("scans") or {}).get(self._last_name) or {}).get("home") or {}
         counts, mx, todo, _ = walls_left(sd)
-        low = min((lv for lv in counts if mx and lv < mx), default=None)
-        if low is None or not paid:
+        levels = [lv for lv in counts if mx and lv < mx]
+        if not levels or not paid:
             return
-        n = min(counts[low], max(1, round(paid / wiki_data()["home:wall"]["levels"][low]["cost"])))
+        unit = getattr(self, "_wall_unit_paid", None)
+        cost = lambda lv: wiki_data()["home:wall"]["levels"][lv]["cost"] if lv < len(wiki_data()["home:wall"]["levels"]) else 0
+        low = min(levels, key=lambda lv: abs(cost(lv) - unit)) if unit else min(levels)
+        n = min(counts[low], getattr(self, "_wall_n", None) or max(1, round(paid / (cost(low) or paid))))
         rows = [r for r in sd["items"] if r.get("key") == "home:wall"]
         for r in rows:
             if r["level"] == low:
@@ -2309,6 +2342,8 @@ class Bot:
             rows = self.find_wall_rows(self.shot()) or rows
         if len(rows) > 1:  # the cheapest affordable level first
             rows = sorted(rows, key=lambda r: self._wall_price.get(r, 10 ** 12))
+        self._wall_unit = getattr(self, "_wall_price", {}).get(rows[0])  # one wall of that row (list price)
+        self._wall_unit = self._wall_unit if self._wall_unit and self._wall_unit < 10 ** 12 else None
         self.tap(rows[0], 1.2)
         f = self.shot()
         if panel_box(f):  # the list sometimes stays open over the buttons: its icon closes it
@@ -2430,9 +2465,11 @@ class Bot:
         if balance is not None and after is not None and after > balance - price * 0.9:
             return self.wall_fail(f"{cur} didn't drop ({balance:,} -> {after:,}), so it didn't go through",
                                   self.shot())
-        self.bump("walls")
-        self._wall_paid = price
-        self.log(f"Bought a wall upgrade for {price:,} {cur}"
+        unit = getattr(self, "_wall_unit", None) if want is None else price  # Upgrade More buys a whole row
+        n = max(1, round(price / unit)) if unit else 1
+        self.bump("walls", n)
+        self._wall_paid, self._wall_n, self._wall_unit_paid = price, n, unit
+        self.log(f"Bought {n} wall upgrade{'s' if n > 1 else ''} for {price:,} {cur}"
                  + (f" ({balance:,} -> {after:,})." if balance is not None and after is not None else "."), "ok")
         return True  # the wall bar left open doesn't block Attack
 
@@ -3539,10 +3576,10 @@ class Bot:
             while y < H and col[y] >= 250:
                 y += 1
             bot = y
-            # a whole card, or one cut off by the bottom edge with its name line showing. One cut off at the top
-            # (sliding under the header) would have its lower lines read as the name - every swipe overlaps the
-            # last, so it was read whole on the screen before
-            if bot - top < 110 * k and not (bot >= H - 1 and bot - top >= 60 * k):
+            # a whole card, or one cut off by the bottom edge with its name + in-game name showing. One cut off at
+            # the top (sliding under the header) would have its lower lines read as the name - every swipe overlaps
+            # the last, so it was read whole on the screen before
+            if bot - top < 110 * k and not (bot >= H - 1 and bot - top >= 82 * k):
                 continue
             avatar = g[top:bot, int(1365 * k):int(1450 * k)]
             if avatar.size == 0 or avatar.mean() > 235:  # no avatar: the 'SWITCH ID' header, not an account
@@ -3558,59 +3595,118 @@ class Bot:
             except Exception:
                 continue
             name = re.sub(r"\s+", " ", name).strip(" |_-.,'\"")
-            if len(name) < 2:
-                continue
+            game = re.sub(r"\s+", " ", game).strip(" |_-.,'\"~*><")
+            if len(re.sub(r"\W", "", name)) < 2:  # emoji / another alphabet: unreadable, not a name
+                name = ""
+            # the card's look (avatar + name + in-game name): tells cards apart even when the names read the same
+            # or can't be read at all (emoji, other alphabets) - and the same card on two screens matches
+            fp = g[top:top + int(80 * k), int(1350 * k):int(1790 * k)].astype(np.int16)  # full size: one digit counts
             rows.append({"sc": name, "game": game, "th": int(th.group(1)) if th and int(th.group(1)) <= 20 else None,
-                         "xy": (int(1520 * k), top + int(35 * k))})
+                         "xy": (int(1520 * k), top + int(35 * k)), "fp": fp})
         return rows or None
 
-    def all_accounts(self):
-        """Every account on the Supercell ID panel, top to bottom, scrolling down for long lists (10+ accounts).
-        Returns (rows, the panel's last view)."""
+    def walk_accounts(self, stop=None):
+        """Scroll the Supercell ID panel to the top, then down card by card: every account once, in list order
+        (a card on two screens is matched by its look, not its OCR'd name). stop(row, index) -> True ends the walk
+        with that row on screen (its 'xy' is where it is now). Returns the rows seen."""
         k = self.shot().shape[1] / 1920
         for _ in range(25):  # from the very top: the panel can open where it was last scrolled to
             self.adb.swipe(int(1620 * k), int(600 * k), int(1620 * k), int(1000 * k), 300)
         self.sleep(1.0)
-        seen, frame = {}, self.shot()
+        seen, frame, offset = [], self.shot(), 0
         self._list_end = False
         for _ in range(40):  # ~2.5 accounts per swipe: room for 100 (stops at the end of the list)
-            key = lambda r: re.sub(r"\W", "", r["sc"].lower())  # the same card read on two screens
-            rows = self.list_accounts(frame)
-            for r in rows:  # first seen cut off at the bottom: its Town Hall line comes with a later, whole read
-                if key(r) in seen and seen[key(r)]["th"] is None and r["th"] is not None:
-                    seen[key(r)]["th"] = r["th"]
-            new = [r for r in rows if key(r) not in seen]
-            for r in new:
-                seen[key(r)] = r
-            if not new or self._list_end:
+            fresh = 0
+            for r in self.list_accounts(frame):
+                # where the card is on the whole list (screen y + how far the list has scrolled): each card is
+                # itself, whatever its name reads as - two 'Bob's, an emoji name, an OCR slip
+                r["list_y"] = r["xy"][1] + offset
+                old = next((s for s in seen if abs(s["list_y"] - r["list_y"]) < 40 * k), None)
+                if old is not None:
+                    if old["th"] is None and r["th"] is not None:  # first seen cut off at the bottom
+                        old["th"] = r["th"]
+                    old["xy"] = r["xy"]
+                    continue
+                seen.append(r)
+                fresh += 1
+                if stop and stop(r, len(seen) - 1):
+                    return seen
+            if not fresh or self._list_end:
                 break
             self.adb.swipe(int(1620 * k), int(960 * k), int(1620 * k), int(620 * k), 700)  # inside the panel
             self.sleep(1.2)
-            frame = self.shot()
-        known = [{"sc": r["sc"], "game": r["game"], "th": r["th"]} for r in seen.values()]
+            prev, frame = frame, self.shot()
+            offset += self.list_shift(prev, frame)
+        return seen
+
+    @staticmethod
+    def list_shift(a, b):
+        """How far the account list scrolled between two screenshots: the bottom of the old screen, found in the
+        new one. (A swipe never moves it the same amount twice - and not at all at the end of the list.)"""
+        k = a.shape[1] / 1920
+        x0, x1 = int(1350 * k), int(1890 * k)
+        ga, gb = (cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in (a, b))
+        y0, y1 = int(860 * k), int(1040 * k)
+        res = cv2.matchTemplate(gb[int(492 * k):, x0:x1], ga[y0:y1, x0:x1], cv2.TM_CCOEFF_NORMED)
+        _, score, _, loc = cv2.minMaxLoc(res)
+        if score < 0.8:
+            return int(340 * k)  # couldn't tell: what the swipe asks for
+        return y0 - (loc[1] + int(492 * k))
+
+    @staticmethod
+    def label_accounts(rows):
+        """A unique name per account for the picker / logs: its Supercell ID name; when two read the same (or
+        can't be read), the in-game name and Town Hall are added, then a number."""
+        base = [r["sc"] or r["game"] or "Account" for r in rows]
+        out = []
+        for i, r in enumerate(rows):
+            lab = base[i]
+            if base.count(lab) > 1:
+                lab = f"{lab} ({r['game'] or '?'}" + (f", TH{r['th']}" if r["th"] else "") + ")"
+            n, cand = 2, lab
+            while cand in out:
+                cand, n = f"{lab} #{n}", n + 1
+            out.append(cand)
+        return out
+
+    def all_accounts(self):
+        """Every account on the Supercell ID panel, top to bottom (scrolling for long lists), each with a unique
+        'sc' label and its 'pos' on the list. Saved for the phone view's account picker."""
+        seen = self.walk_accounts()
+        for r, lab, i in zip(seen, self.label_accounts(seen), range(len(seen))):
+            r["name"], r["sc"], r["pos"] = r["sc"], lab, i
+        known = [{"sc": r["sc"], "name": r["name"], "game": r["game"], "th": r["th"], "pos": r["pos"]} for r in seen]
         if known and not self._list_end:  # didn't get to the bottom: keep accounts saved before that weren't seen
-            known += [a for a in self.cfg.get("sc_accounts") or [] if re.sub(r"\W", "", (a.get("sc") or "").lower()) not in seen]
-        if known and known != self.cfg.get("sc_accounts"):  # for the phone view's account picker
+            norm = lambda s: re.sub(r"\W", "", (s or "").lower())
+            have = {norm(a["sc"]) for a in known}
+            known += [a for a in self.cfg.get("sc_accounts") or [] if norm(a.get("sc")) not in have]
+        if known and known != self.cfg.get("sc_accounts"):
             self.cfg["sc_accounts"] = known
             save_config(self.cfg)
-        return list(seen.values())
+        return seen
 
     def tap_account(self, sc):
-        """Scroll the Supercell ID panel back to the top, then down until that account is on screen; tap it."""
-        f = self.shot()
-        k = f.shape[1] / 1920
-        if not any(re.sub(r"\W", "", r["sc"].lower()) == re.sub(r"\W", "", sc.lower()) for r in self.list_accounts(f)):  # not on screen: back to the top first
-            for _ in range(25):  # back to the top of a long list
-                self.adb.swipe(int(1620 * k), int(600 * k), int(1620 * k), int(1000 * k), 300)
-            self.sleep(1.0)
-        for _ in range(40):
-            same = lambda a, b: re.sub(r"\W", "", a.lower()) == re.sub(r"\W", "", b.lower())  # OCR case / spacing
-            row = next((r for r in self.list_accounts(self.shot()) if same(r["sc"], sc)), None)
-            if row:
-                self.tap(row["xy"], 4.0)
+        """Tap an account on the Supercell ID panel: the card at its saved place on the list (checked against its
+        name / in-game name), else the first card whose name matches."""
+        norm = lambda s: re.sub(r"\W", "", (s or "").lower())
+        acc = next((a for a in self.cfg.get("sc_accounts") or [] if norm(a.get("sc")) == norm(sc)), None)
+        like = lambda r: acc is not None and ((acc.get("name") is not None and norm(r["sc"]) == norm(acc["name"])
+                                              and (not acc.get("game") or norm(r["game"]) == norm(acc["game"])))
+                                             or (norm(r["game"]) and norm(r["game"]) == norm(acc.get("game"))
+                                                 and r["th"] == acc.get("th")))
+        hit = []
+
+        def at(r, i):
+            if (acc is not None and i == acc.get("pos") and like(r)) or (acc is None and norm(r["sc"]) == norm(sc)):
+                hit.append(r)
                 return True
-            self.adb.swipe(int(1620 * k), int(960 * k), int(1620 * k), int(620 * k), 700)
-            self.sleep(1.2)
+            return False
+        self.walk_accounts(at)
+        if not hit and acc is not None:  # the list changed since it was saved: find it by name instead
+            self.walk_accounts(lambda r, i: like(r) and (hit.append(r) or True))
+        if hit:
+            self.tap(hit[0]["xy"], 4.0)
+            return True
         return False
 
     @staticmethod
@@ -3639,11 +3735,11 @@ class Bot:
             self.log(f"Two accounts are called '{name}': this one's planner data is now under '{key}'.", "ok")
         return key
 
-    def switch_account(self, target=None):
+    def switch_account(self, target=None, full_rotation=False):
         """Settings cog -> blue switch button -> tap the next account on the Supercell ID list (or `target`, a
         Supercell ID name - picked on the phone view)."""
         # _switch_streak = accounts already left because they were busy; this one is busy too
-        if not target and self._n_accounts and self._switch_streak + 1 >= self._n_accounts:
+        if not target and not full_rotation and self._n_accounts and self._switch_streak + 1 >= self._n_accounts:
             self._switch_streak = 0
             if self.cfg["stop_when_all_busy"]:
                 self.log("Every account's builders and lab are busy - nothing left to do, stopping.", "ok")
@@ -3696,6 +3792,10 @@ class Bot:
                 cur = next((i for i, r in enumerate(rows) if self.same_game_name(r["game"], bare)
                             and (hall is None or r["th"] in (None, hall))), None)
         self._acc_idx = ((cur if cur is not None and not target else self._acc_idx) + 1) % len(rows)
+        for _ in range(len(rows)):  # Fill & Switch: skip accounts already found full
+            if not full_rotation or rows[self._acc_idx]["sc"] not in getattr(self, "_full_done", set()):
+                break
+            self._acc_idx = (self._acc_idx + 1) % len(rows)
         row = rows[self._acc_idx]
         name = row["sc"]
         self.log(f"Switching account -> {name}", "ok")
@@ -4634,12 +4734,13 @@ CARD2, CARD_HI, DEEP, LINE = "#1f2430", "#2a3142", "#0b0d12", "#252b38"  # tile 
 # what the mode picker shows: mode -> (name, what it does, icon in wiki/ui), grouped by village
 MODES = {"farm": ("Farm & Upgrade", "Attacks and keeps every builder, the lab and pets busy.", "king"),
          "loot": ("Attack Only", "Just attacks on this account - no upgrades, walls or switching.", "gold"),
+         "loot_rotate": ("Fill & Switch", "Attacks until gold + elixir are full, then the next account (stops when all are full).", "builder_icon"),
          "walls": ("Walls", "Farms and spends the storages on walls.", "wall"),
          "bb_farm": ("Farm & Upgrade", "Builder Base attacks + upgrades (Star Lab, Clock Tower boost, cart).",
                      "builderhall"),
          "bb_loot": ("Attack Only", "Builder Base attacks only - daily stars and loot.", "bgold"),
          "bb_walls": ("Walls", "Builder Base walls: farms and buys them.", "wall")}
-VILLAGES = (("Home Village", ("farm", "loot", "walls")), ("Builder Base", ("bb_farm", "bb_loot", "bb_walls")))
+VILLAGES = (("Home Village", ("farm", "loot", "loot_rotate", "walls")), ("Builder Base", ("bb_farm", "bb_loot", "bb_walls")))
 mode_name = lambda m: f"{MODES[m][0]} · {'Builder Base' if m.startswith('bb_') else 'Home Village'}"
 GREEN, AMBER, RED, BLUE, GOLD, PINK = "#3ddc97", "#f2b84b", "#ff6b6b", "#5aa9ff", "#f5b942", "#e07bff"
 
@@ -5954,7 +6055,7 @@ class App(tk.Tk):
             st["modes"] = [[v, [[k, MODES[k][0]] for k in ms]] for v, ms in VILLAGES]
             st["options"] = {k: bool(self.cfg[k]) for k in PHONE_OPTIONS}
             st["resume_in"] = max(0, int(self._resume[0] - time.time())) if self._resume else 0
-            st["accounts"] = [[a["sc"], a["sc"] + (f" - {a['game']}" if a.get("game") else "")
+            st["accounts"] = [[a["sc"], a["sc"] + (f" - {a['game']}" if a.get("game") and a["game"] not in a["sc"] else "")
                                + (f" (TH{a['th']})" if a.get("th") else "")] for a in self.cfg.get("sc_accounts") or []]
             st["current_acc"] = getattr(self.bot, "_cur_sc", None) if self.bot else None
             st["bb"] = self.bb_view
