@@ -76,7 +76,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 72  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 73  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -335,7 +335,7 @@ SETTINGS = [
 NEW_UI_REGIONS = {"bank_gold_region": [1446, 22, 1924, 95], "bank_elixir_region": [1508, 98, 1907, 165],
                   "bank_dark_region": [1610, 170, 1840, 235], "loot_gold_region": [81, 135, 405, 180],
                   "loot_elixir_region": [81, 186, 405, 232]}
-RUNTIME_KEYS = ("ui_v", "scans", "plans", "account_tags", "_last_account_idx", "loot_rate", "line_view", "ui_mode",
+RUNTIME_KEYS = ("rotation_accounts", "ui_v", "scans", "plans", "account_tags", "_last_account_idx", "loot_rate", "line_view", "ui_mode",
                 "sc_of_tag", "shortcuts_v", "sc_accounts")  # saved by the bot, not settings
 # Rarely-touched tuning: shown under 'Show advanced settings'
 ADVANCED = {"loot_settle_delay", "loot_recheck_delay", "loot_max_plausible", "hold_deploy", "damage_confirm_count",
@@ -1463,6 +1463,8 @@ class Bot:
     # --- main loop ---
     def run(self):
         self.log("Farming started.", "ok")
+        if self.mode == "loot_rotate" or (self.mode == "farm" and self.cfg["rotate_accounts"]):
+            self.list_req = True  # read the Supercell ID list first: accounts added since the last read
         self.emit("stats", dict(self.stats))
         prev, unknown_since, backs, adb_fails, online = "START", None, 0, 0, None
         awake = lambda on: os.name == "nt" and ctypes.windll.kernel32.SetThreadExecutionState(
@@ -1578,7 +1580,11 @@ class Bot:
         cand = [i for i in range(1, n) if 10 * k <= st[i, 3] <= 40 * k and st[i, 2] <= 40 * k
                 and st[i, 1] > 0 and st[i, 1] + st[i, 3] < c.shape[0]]
         base = np.median([st[i, 1] + st[i, 3] for i in cand]) if cand else 0
-        keep = [i for i in cand if abs(st[i, 1] + st[i, 3] - base) <= 3 * k]
+        on_line = [i for i in cand if abs(st[i, 1] + st[i, 3] - base) <= 3 * k]
+        top = min((st[i, 1] for i in on_line), default=0)
+        # + letters with a tail below the line (p, g, y, q, j): they start inside the line, end a little lower
+        keep = [i for i in cand if i in on_line or (top - 3 * k <= st[i, 1] <= base - 4 * k
+                                                    and 0 < st[i, 1] + st[i, 3] - base <= 12 * k)]
         if keep:  # one word: drop shapes far to the right of the name (a gap wider than two letters)
             keep.sort(key=lambda i: st[i, 0])
             word = [keep[0]]
@@ -1607,8 +1613,9 @@ class Bot:
         letters = len(keep) - len(tail)
         same = [n for n in self._names if re.sub(r"\D", "", n) == tail and abs(len(re.sub(r"\d", "", n)) - letters) <= 1]
         digits = re.sub(r"\D", "", name)  # GeoCol2 vs GeoCol3 are different accounts: never snap across digits
-        if len(same) == 1 and keep:  # one known account fits the shapes: that's it, whatever Tesseract made of it
-            name, digits = same[0], tail
+        if len(same) == 1 and keep and difflib.SequenceMatcher(None, re.sub(r"\d", "", name.lower()),
+                                                               re.sub(r"\d", "", same[0].lower())).ratio() >= 0.5:
+            name, digits = same[0], tail  # one known account fits the shapes AND the letters roughly agree
         near = difflib.get_close_matches(name, [n for n in self._names if re.sub(r"\D", "", n) == digits], 1, 0.7)
         if near:
             self._last_name = near[0]
@@ -1631,7 +1638,7 @@ class Bot:
         pre, self._pre = self._pre, None
         if pre and pre[0] == name and None not in now[:2] and None not in pre[1][:2]:
             gain = [max(0, (n or 0) - (p or 0)) if n is not None and p is not None else 0 for n, p in zip(now, pre[1])]
-            self.note_full(name, gain[:2])
+            self.note_full(name, gain, now)
             if any(gain) and max(gain) <= 20_000_000:  # sanity: no single attack brings more
                 row = self.loot.setdefault(name, [0, 0, 0, 0])
                 for i, g in enumerate(gain):
@@ -1642,21 +1649,24 @@ class Bot:
         self._cur = (name, now)
         return storage
 
-    def note_full(self, name, gain):
-        """After an attack: a storage that gained under 10% of what the base offered (300k+) is full. Two such
-        attacks in a row for both gold and elixir = this account's storages are full (one can be a bad attack)."""
+    def note_full(self, name, gain, now):
+        """After an attack: gold, elixir AND dark elixir all unchanged (an attack on a base with loot always adds
+        some) = every storage is full. Dark is only required when it could be read."""
         offered, self._offered = getattr(self, "_offered", None), None
-        if not offered or None in offered:
-            return
-        full = all(o >= 300_000 and g < o * 0.1 for g, o in zip(gain, offered))
-        hits = self.__dict__.setdefault("_full_hits", {})
-        hits[name] = hits.get(name, 0) + 1 if full else 0
-        if full:
-            self.log(f"{name}: storages look full (gained {gain[0]:,} gold / {gain[1]:,} elixir of "
-                     f"{offered[0]:,} / {offered[1]:,} offered).")
+        if offered and None not in offered and sum(offered) < 200_000:
+            return  # an almost empty base proves nothing
+        same = [g <= 1000 for g in gain[:2]] + ([gain[2] <= 50] if now[2] is not None else [])
+        full = self.__dict__.setdefault("_full", {})
+        full[name] = all(same)
+        if full[name]:
+            self.log(f"{name}: gold, elixir and dark elixir didn't change after that attack - storages are full.",
+                     "ok")
+        elif any(same):
+            self.log(f"{name}: {', '.join(c for c, s in zip(('gold', 'elixir', 'dark elixir'), same) if s)} full - "
+                     "farming on until all three are.")
 
     def storages_full(self, name):
-        return self.__dict__.get("_full_hits", {}).get(name, 0) >= 2
+        return self.__dict__.get("_full", {}).get(name, False)
 
     def attack_now(self):
         self._pre = self._cur  # storage right before this attack
@@ -1733,10 +1743,14 @@ class Bot:
             if self.scan_export():
                 return
         storage = self.track_loot(frame, self.read_storage(frame))
+        if getattr(self, "_need_wall_scan", False) and self.mode != "loot_rotate":
+            self._need_wall_scan = False
+            if self.scan_export():  # the dashboard's Walls card needs this account's walls
+                return
         if self.mode == "loot_rotate":  # Attack & Switch: farm this account until its storages are full, then
             name = self._last_name or "?"  # the next account; when every account is full, stop
             if self.storages_full(name):
-                self.log(f"{name}: gold and elixir storages are full - switching to the next account.", "ok")
+                self.log(f"{name}: all storages are full - switching to the next account in the rotation.", "ok")
                 self._full_done = getattr(self, "_full_done", set()) | {getattr(self, "_cur_sc", None) or name}
                 if self._n_accounts and len(self._full_done) >= self._n_accounts:
                     self.log("Every account's storages are full - nothing left to farm. Stopping.", "ok")
@@ -2165,6 +2179,8 @@ class Bot:
         sd = ((self.cfg.get("scans") or {}).get(self._last_name) or {}).get("home") or {}
         counts, mx, todo, _ = walls_left(sd)
         levels = [lv for lv in counts if mx and lv < mx]
+        if not counts:  # this account's scan has no walls (an old builder-list scan): the export has them all
+            self._need_wall_scan = True
         if not levels or not paid:
             return
         unit = getattr(self, "_wall_unit_paid", None)
@@ -3683,6 +3699,7 @@ class Bot:
         if known and known != self.cfg.get("sc_accounts"):
             self.cfg["sc_accounts"] = known
             save_config(self.cfg)
+        self.emit("accounts", None)
         return seen
 
     def tap_account(self, sc):
@@ -3772,6 +3789,9 @@ class Bot:
         wanted = {a.strip().lower() for a in self.cfg["accounts"].split(",") if a.strip()} if not target else None
         if wanted:
             rows = [r for r in rows if r["sc"].lower() in wanted]
+        picked = self.cfg.get("rotation_accounts")  # the dashboard / phone 'Accounts in rotation' picker
+        if picked is not None and not target:
+            rows = [r for r in rows if r["sc"] in picked]
         self._n_accounts = len(rows)
         if len(rows) < 2 and not target:
             return self.switch_fail(f"need 2+ accounts to rotate, found {[r['sc'] for r in rows]}")
@@ -3791,6 +3811,9 @@ class Bot:
             else:
                 cur = next((i for i, r in enumerate(rows) if self.same_game_name(r["game"], bare)
                             and (hall is None or r["th"] in (None, hall))), None)
+            same = [i for i, r in enumerate(rows) if self.same_game_name(r["game"], bare)]
+            if cur is None and len(same) == 1:  # only one account on the list has this in-game name: it's this one
+                cur = same[0]
         self._acc_idx = ((cur if cur is not None and not target else self._acc_idx) + 1) % len(rows)
         for _ in range(len(rows)):  # Fill & Switch: skip accounts already found full
             if not full_rotation or rows[self._acc_idx]["sc"] not in getattr(self, "_full_done", set()):
@@ -3824,6 +3847,7 @@ class Bot:
                 if self._sc_key:
                     self._last_name = self._sc_key
                 self.emit("state", f"Home village ({self._last_name})")
+                self.emit("scan", self._last_name)  # the Walls card puts this account first
                 return True
             if self.tutorial(f) or self.event_chest(f) or self.close_popup(f):
                 continue
@@ -4092,6 +4116,10 @@ h2{font-size:12px;color:#9a9a9a;text-transform:uppercase;letter-spacing:.05em;ma
 .ctl .go.stop{background:#a33a3a;color:#fff}
 .opts{display:flex;flex-wrap:wrap;gap:6px 16px;flex-basis:100%;font-size:14px}.opts label{display:flex;align-items:center;gap:6px}
 .opts input{width:18px;height:18px;accent-color:#f5c542}
+.rot{flex-basis:100%;background:#171b24;border-radius:10px;padding:10px 12px}.rot summary{cursor:pointer;font-weight:600}
+#rotl{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;margin-top:8px;font-size:14px}
+#rotl label{display:flex;align-items:center;gap:6px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#rotl input{width:18px;height:18px;accent-color:#f5c542;flex:none}
 .ctl #cmsg{flex-basis:100%;color:#9a9a9a;font-size:12px}
 #log{background:#141414;border-radius:12px;padding:10px;font:12px ui-monospace,Consolas,monospace;white-space:pre-wrap;
 max-height:260px;overflow:auto}
@@ -4101,6 +4129,7 @@ max-height:260px;overflow:auto}
 <div class="pill idle" id="state">&hellip;</div></header>
 <img id="f" alt="">
 <div class="card ctl"><select id="m"></select><button id="go" class="go">Start</button>
+<details id="rot" class="rot"><summary id="rots">Accounts in rotation</summary><div id="rotl"></div></details>
 <div class="opts" id="opts"><label><input type="checkbox" id="o_rotate_accounts">Switch accounts when all busy</label>
 <label><input type="checkbox" id="o_builder_base_enabled">Visit the Builder Base</label></div>
 <select id="pz"><option value="">Pause&hellip;</option><option value="15">15 min</option><option value="30">30 min</option>
@@ -4121,7 +4150,7 @@ async function cmd(o){$("cmsg").textContent="Sending…";try{const r=await fetch
 headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});$("cmsg").textContent=(await r.json()).msg||"";}
 catch(e){$("cmsg").textContent="PC not reachable.";}setTimeout(tick,600);}
 $("go").onclick=()=>RUN?confirm("Stop farming?")&&cmd({action:"stop"}):cmd({action:"start",mode:$("m").value});
-$("m").onchange=()=>{$("opts").style.display=$("m").value==="farm"?"flex":"none";if(RUN&&$("m").value!==MODE){confirm("Switch to "+$("m").selectedOptions[0].text+"?")?
+$("m").onchange=()=>{$("opts").style.display=$("m").value==="farm"?"flex":"none";$("rot").style.display=["farm","loot_rotate"].includes($("m").value)?"block":"none";if(RUN&&$("m").value!==MODE){confirm("Switch to "+$("m").selectedOptions[0].text+"?")?
 cmd({action:"start",mode:$("m").value}):($("m").value=MODE);}};
 $("pz").onchange=()=>{const v=$("pz").value;$("pz").value="";if(v&&confirm("Pause for "+v+" minutes?"))cmd({action:"pause",minutes:+v});};
 $("rg").onclick=()=>confirm("Restart Clash of Clans?")&&cmd({action:"restart_game"});
@@ -4143,10 +4172,17 @@ $("mode").textContent=s.mode?"Mode: "+s.mode:"";
 if(s.modes&&!$("m").options.length)$("m").innerHTML=s.modes.map(([v,ms])=>`<optgroup label="${v}">`+
 ms.map(([k,l])=>`<option value="${k}">${l}</option>`).join("")+"</optgroup>").join("");
 const O=s.options||{};for(const k in O)if(document.activeElement!==$("o_"+k))$("o_"+k).checked=O[k];
+const RA=s.accounts||[],RT=s.rotation||[],RK=JSON.stringify([RA,RT]);if($("rotl").dataset.k!==RK&&!$("rotl").contains(document.activeElement)){
+$("rotl").dataset.k=RK;$("rots").textContent="Accounts in rotation: "+RT.length+" of "+RA.length;
+$("rotl").innerHTML=RA.map(([k])=>`<label><input type="checkbox" value="${esc(k)}"${RT.includes(k)?" checked":""}>${esc(k)}</label>`).join("")
+||'<span class="sub">Press Rescan accounts first.</span>';
+$("rotl").querySelectorAll("input").forEach(i=>i.onchange=()=>cmd({action:"set_rotation",
+accounts:[...$("rotl").querySelectorAll("input:checked")].map(x=>x.value)}));}
 const A=s.accounts||[],AK=JSON.stringify(A);if($("acc").dataset.k!==AK){$("acc").dataset.k=AK;ACCS=A;fillAcc();}
 $("sw").textContent=A.length?"Switch account":"Load accounts";if(s.current_acc&&$("acc").dataset.cur!==s.current_acc&&!$("accq").value){$("acc").dataset.cur=s.current_acc;$("acc").value=s.current_acc;}
-RUN=!!s.running;MODE=s.mode_key||"";if(document.activeElement!==$("m"))$("m").value=MODE;
+RUN=!!s.running;MODE=s.mode_key||"";if($("m").dataset.cur!==MODE){$("m").dataset.cur=MODE;$("m").value=MODE;}
 $("opts").style.display=$("m").value==="farm"?"flex":"none";
+$("rot").style.display=["farm","loot_rotate"].includes($("m").value)?"block":"none";
 $("go").textContent=RUN?"Stop":"Start";$("go").className="go"+(RUN?" stop":"");
 if(s.resume_in>0)$("cmsg").textContent="Paused - starts again in "+Math.ceil(s.resume_in/60)+" min.";
 const B=s.bb,I=k=>B&&k!="dark"?"b"+k:k;$("rates").className="row "+(B?"r2":"r3");
@@ -4164,7 +4200,8 @@ $("f").src="frame.jpg"+Q+"&t="+Date.now();}catch(e){const st=$("state");st.textC
 tick();setInterval(tick,1500);</script></body></html>"""
 
 
-PHONE_ACTIONS = ("start", "stop", "pause", "restart_game", "switch_account", "load_accounts", "set_option")
+PHONE_ACTIONS = ("start", "stop", "pause", "restart_game", "switch_account", "load_accounts", "set_option",
+                 "set_rotation")
 PHONE_OPTIONS = ("rotate_accounts", "builder_base_enabled")  # the only settings the phone can change
 
 
@@ -4734,7 +4771,7 @@ CARD2, CARD_HI, DEEP, LINE = "#1f2430", "#2a3142", "#0b0d12", "#252b38"  # tile 
 # what the mode picker shows: mode -> (name, what it does, icon in wiki/ui), grouped by village
 MODES = {"farm": ("Farm & Upgrade", "Attacks and keeps every builder, the lab and pets busy.", "king"),
          "loot": ("Attack Only", "Just attacks on this account - no upgrades, walls or switching.", "gold"),
-         "loot_rotate": ("Fill & Switch", "Attacks until gold + elixir are full, then the next account (stops when all are full).", "builder_icon"),
+         "loot_rotate": ("Fill & Switch", "Attacks until gold, elixir + dark are all full, then the next account in the rotation.", "builder_icon"),
          "walls": ("Walls", "Farms and spends the storages on walls.", "wall"),
          "bb_farm": ("Farm & Upgrade", "Builder Base attacks + upgrades (Star Lab, Clock Tower boost, cart).",
                      "builderhall"),
@@ -5693,6 +5730,15 @@ class App(tk.Tk):
                 self.log(on if v.get() else off, "ok")
             ttk.Checkbutton(self.opt_row, text=label, variable=v, command=flip,
                             style="Bg.Switch.TCheckbutton").pack(side="left", padx=S(0, 18))
+        # which accounts take part in the rotation (Farm & Upgrade with switching, Fill & Switch)
+        self.rot_row = tk.Frame(modes, bg=BG)
+        self.rot_btn = ttk.Menubutton(self.rot_row, text="", style="TMenubutton")
+        self.rot_btn.pack(side="left")
+        self.rot_menu = tk.Menu(self.rot_btn, tearoff=False, bg=CARD2, fg=TEXT, activebackground=CARD_HI,
+                                activeforeground=TEXT, selectcolor=GOLD, bd=0, postcommand=self.fill_rot_menu)
+        self.rot_btn["menu"] = self.rot_menu
+        self.rot_vars = {}
+        self.fill_rot_menu()
         self.pick_mode(self.mode_var.get(), save=False)
 
         nb = self.nb = ttk.Notebook(main, style="Hidden.TNotebook")  # pages; the sidebar is the tab row
@@ -5707,6 +5753,36 @@ class App(tk.Tk):
         self._build_setup(tabs["Setup"])
         self._build_settings(tabs["Settings"])
         self._build_log(tabs["Log"])
+
+    def rotation(self):
+        """(saved accounts, the ones in the rotation)."""
+        accs = [a["sc"] for a in self.cfg.get("sc_accounts") or []]
+        picked = self.cfg.get("rotation_accounts")
+        return accs, [a for a in accs if picked is None or a in picked]
+
+    def set_rotation(self, picked, by=""):
+        accs, _ = self.rotation()
+        picked = [a for a in accs if a in picked]
+        self.cfg["rotation_accounts"] = None if len(picked) == len(accs) else picked  # None: everyone, new ones too
+        save_config(self.cfg)  # the running bot shares this dict: the next switch uses it
+        self.log(f"{by}Accounts in the rotation: " + (", ".join(picked) if picked else "none") + ".", "ok")
+        self.fill_rot_menu()
+
+    def fill_rot_menu(self):
+        accs, on = self.rotation()
+        self.rot_btn.config(text=f"👥  Accounts in rotation: {len(on)} of {len(accs)}" if accs
+                            else "👥  Accounts in rotation: read the list first")
+        m = self.rot_menu
+        m.delete(0, "end")
+        self.rot_vars = {}
+        for a in accs:
+            v = self.rot_vars[a] = tk.BooleanVar(value=a in on)
+            m.add_checkbutton(label=a, variable=v, command=lambda: self.set_rotation(
+                [x for x, vv in self.rot_vars.items() if vv.get()]))
+        if accs:
+            m.add_separator()
+            m.add_command(label="Select all", command=lambda: self.set_rotation(accs))
+        m.add_command(label="↻  Rescan accounts", command=lambda: self.phone_cmd({"action": "load_accounts"}))
 
     def set_start(self, state):
         """The big button: Start (gold) / Stop (red) / Stopping... (greyed, not clickable)."""
@@ -5726,6 +5802,10 @@ class App(tk.Tk):
             self.opt_row.pack(fill="x", pady=S(6, 0))
         else:
             self.opt_row.pack_forget()
+        if m in ("farm", "loot_rotate"):
+            self.rot_row.pack(fill="x", pady=S(6, 0))
+        else:
+            self.rot_row.pack_forget()
         self.set_start("start")
         if save and self.cfg.get("ui_mode") != m:
             self.cfg["ui_mode"] = m
@@ -6019,6 +6099,8 @@ class App(tk.Tk):
                         self.res_labels[k].config(text="?" if v is None else f"{v:,}")
                 elif kind == "call":
                     data()
+                elif kind == "accounts":
+                    self.fill_rot_menu()
                 elif kind == "scan":
                     self.render_walls()
                     p = getattr(self, "planner", None)
@@ -6054,6 +6136,7 @@ class App(tk.Tk):
             st["mode_key"] = self.bot.mode if self.bot else self.mode_var.get()
             st["modes"] = [[v, [[k, MODES[k][0]] for k in ms]] for v, ms in VILLAGES]
             st["options"] = {k: bool(self.cfg[k]) for k in PHONE_OPTIONS}
+            st["rotation"] = self.rotation()[1]
             st["resume_in"] = max(0, int(self._resume[0] - time.time())) if self._resume else 0
             st["accounts"] = [[a["sc"], a["sc"] + (f" - {a['game']}" if a.get("game") and a["game"] not in a["sc"] else "")
                                + (f" (TH{a['th']})" if a.get("th") else "")] for a in self.cfg.get("sc_accounts") or []]
@@ -6271,6 +6354,11 @@ class App(tk.Tk):
                 self.start_bot(mode, "phone")
             if self.bot:
                 self.bot.switch_req = sc
+        elif a == "set_rotation":
+            picked = c.get("accounts")
+            if not isinstance(picked, list) or not all(isinstance(x, str) for x in picked):
+                return self.log("📱 Phone: rotation - that list isn't valid.", "warn")
+            self.set_rotation(picked, "📱 Phone: ")
         elif a == "set_option":
             key = c.get("key")
             if key not in PHONE_OPTIONS or not isinstance(c.get("value"), bool):
@@ -6361,7 +6449,8 @@ class App(tk.Tk):
         tagged = set((self.cfg.get("account_tags") or {}).values())
         y, views = 0, []
         self.walls_view = views  # the phone page shows the same lines
-        for acc, bases in sorted((self.cfg.get("scans") or {}).items()):
+        cur = getattr(self.bot, "_last_name", None) if self.bot else None  # the account being farmed goes first
+        for acc, bases in sorted((self.cfg.get("scans") or {}).items(), key=lambda kv: (kv[0] != cur, kv[0])):
             if tagged and acc not in tagged and difflib.get_close_matches(acc, tagged, 1, 0.75):
                 continue
             sd = bases.get("home") or {}
