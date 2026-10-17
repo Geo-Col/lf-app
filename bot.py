@@ -76,7 +76,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 73  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 74  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1144,7 +1144,8 @@ NO_WIKI = ("blacksmith", "reinforcement camp")  # real buildings without wiki da
 
 def is_wall(name):
     """'Wall', 'Wall x28', "': Wall x2" - never bought from the builder list (walls have their own routine)."""
-    return bool(re.fullmatch(r"walls?( x\w*)?", norm_name(name)))  # 'Wall xI50' = OCR'd 'Wall x150'
+    # 'Wall x 55' - the count is often OCR'd as letters ('Wall x SS', 'Wall x I50'); never 'Wall Wrecker'
+    return bool(re.fullmatch(r"\W*walls?\W*(x\s*\S{1,4})?\W*", (name or "").lower()))  # ('Wall x $4')
 
 
 def count_of(name):
@@ -1501,6 +1502,8 @@ class Bot:
                             unknown_since = None
                         elif self.bb_bonus(self._last_name or "?"):  # the Star Bonus popup (home or Builder
                             unknown_since = None                     # Base) - known, so no need to ask Groq
+                        elif self.hero_journey(frame):
+                            unknown_since = None
                         elif self.tutorial(frame):  # the redesign's one-off tutorials
                             unknown_since = None
                         elif self.event_chest(frame):  # chest event: open it, take the reward
@@ -1661,7 +1664,8 @@ class Bot:
         if full[name]:
             self.log(f"{name}: gold, elixir and dark elixir didn't change after that attack - storages are full.",
                      "ok")
-        elif any(same):
+        elif any(same) and self.__dict__.setdefault("_part", {}).get(name) != same:
+            self._part[name] = same  # (said once - not after every attack)
             self.log(f"{name}: {', '.join(c for c, s in zip(('gold', 'elixir', 'dark elixir'), same) if s)} full - "
                      "farming on until all three are.")
 
@@ -1706,6 +1710,10 @@ class Bot:
         f = self.shot()
         self.open_settings()
         sw = self.wait_for("switch_account_button", 5)
+        if not sw:  # not on the village when asked (a results screen, a popup...): once more from the village
+            self.back_to_village()
+            self.open_settings()
+            sw = self.wait_for("switch_account_button", 5)
         if sw:
             self.tap(sw, 2.5)
             if self.wait_for("supercell_id_header", 6):
@@ -1732,9 +1740,22 @@ class Bot:
         self.switch_account(target=sc)
         return True
 
+    def hero_journey(self, frame):
+        """'Hero Journey - Challenge Progress Completed! Claim!' over the village (it covers the Build panel):
+        claim the free reward. True if it was showing."""
+        hit = self.v.find(frame, "hero_journey", 0.85)
+        if not hit:
+            return False
+        k = frame.shape[1] / 1920
+        self.log("Claiming a completed Hero Journey challenge.")
+        self.tap((hit[0] + int(78 * k), hit[1] + int(168 * k)), 2.5)
+        return True
+
     def on_home(self, frame, prev):
         self.game_relaunches = 0
         self._view = None
+        if self.hero_journey(frame):
+            return
         if self.phone_switch():
             return
         self.account_name(frame)
@@ -1751,7 +1772,12 @@ class Bot:
             name = self._last_name or "?"  # the next account; when every account is full, stop
             if self.storages_full(name):
                 self.log(f"{name}: all storages are full - switching to the next account in the rotation.", "ok")
-                self._full_done = getattr(self, "_full_done", set()) | {getattr(self, "_cur_sc", None) or name}
+                label = getattr(self, "_cur_sc", None)
+                if not label:  # started on this account: find its list entry by its in-game name
+                    hits = [x["sc"] for x in self.cfg.get("sc_accounts") or []
+                            if self.same_game_name(x.get("game") or "", re.sub(r" \(.*\)$", "", name))]
+                    label = hits[0] if len(hits) == 1 else name
+                self._full_done = getattr(self, "_full_done", set()) | {label}
                 if self._n_accounts and len(self._full_done) >= self._n_accounts:
                     self.log("Every account's storages are full - nothing left to farm. Stopping.", "ok")
                     self.stop_evt.set()
@@ -1776,6 +1802,10 @@ class Bot:
                 raise Abort()
             if self.spend_bank(storage, price):
                 return
+            if getattr(self, "_no_wall_rows", False):  # the builder list has no Wall row left
+                self.log("Every wall on this account is max - nothing left to buy. Stopping.", "ok")
+                self.stop_evt.set()
+                raise Abort()
             return self.attack_now()
         for kind in ("builder", "lab", "pets"):
             if self.cfg[f"{kind}_upgrades_enabled"] and time.time() >= self._upgrade_backoff.get(kind, 0):
@@ -2256,11 +2286,23 @@ class Bot:
                 self.log(f"Couldn't buy a {cur} wall - trying again in 5 min.", "warn")
         return did
 
+    def list_settled(self, timeout=4.0):
+        """A screenshot once the upgrade panel's list has stopped gliding (two frames alike)."""
+        prev, end = None, time.time() + timeout
+        while True:
+            f = self.shot()
+            box = panel_box(f)
+            roi = cv2.cvtColor(f[box[2]:box[3], box[0]:box[1]], cv2.COLOR_BGR2GRAY) if box else None
+            if roi is None or (prev is not None and prev.shape == roi.shape and cv2.absdiff(roi, prev).mean() < 1.5)                     or time.time() > end:
+                return f
+            prev = roi
+            self.sleep(0.3)
+
     def find_wall_rows(self, frame):
         """'Wall' rows in the open builder list, via Tesseract word search (clean white-on-dark text). Only inside
         the list: a selected wall's own bar says 'Remove Wall' / 'Add Wall', and those must never be tapped."""
         rows = [r for r in list_rows(frame) if is_wall(r[0])]
-        self._wall_price = {r[3]: (r[1] if r[2] else 10 ** 12) for r in rows}  # unaffordable (red) ones last
+        self._wall_price = {r[3]: r[1] for r in rows}  # (red = not enough GOLD - an elixir buy can still pay it)
         return [r[3] for r in rows]
 
     def wall_fail(self, why, frame):
@@ -2312,54 +2354,57 @@ class Bot:
         """Open the builder list (kind 'bb_builder': the Builder Base's), tap a 'Wall' row once the list has stopped
         sliding, close the list. Returns the Upgrade More button if a wall really is selected, else None."""
         icon = top_bar(self.shot(), kind)[0]
-        frame = self.shot()
-        rows = self.find_wall_rows(frame)
-        opened = bool(rows)
-        if not rows:  # list not open yet
-            self.tap(icon, 1.2)
-            prev = None
-            for _ in range(10):
-                frame = self.shot()
-                rows = self.find_wall_rows(frame)
-                if rows:
+        # 1) the whole list once: every 'Wall xN' level and its price (the list's order changes between openings -
+        #    a 'Suggested' section moves rows around - so the first Wall row seen isn't necessarily the one to buy)
+        if panel_box(self.shot()):
+            self.tap(icon, 1.0)  # close + reopen: from the top
+        self.tap(icon, 1.3)
+        prices, prev, opened = set(), None, False
+        for _ in range(16):
+            f = self.list_settled()
+            if not panel_box(f):
+                if self.v.find(f, "all_upgrades_complete", 0.75):  # a fully maxed village: no list at all
+                    opened = True
                     break
-                box = panel_box(frame)
-                if not box:  # not open (yet): never swipe then - it would drag the village (onto the boat...)
-                    if self.v.find(frame, "all_upgrades_complete", 0.75):  # a fully maxed village: no list at all
-                        opened = True
-                        break
-                    self.sleep(0.6)
-                    continue
-                opened = True
-                roi = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)[150:-150:4, ::4]
-                if prev is not None and cv2.absdiff(roi, prev).mean() < 2:
-                    break  # list stopped moving: reached the bottom
-                prev = roi
-                self.scroll_panel(box)  # inside the list only
-        self._no_wall_rows = opened and not rows  # the list opened, scrolled to the end: no 'Wall' row = all max
+                self.sleep(0.6)
+                continue
+            opened = True
+            prices |= {r[1] for r in list_rows(f) if is_wall(r[0])}
+            sig = [r[:2] for r in list_rows(f)]
+            if sig == prev:
+                break  # didn't move: the bottom
+            prev = sig
+            self.scroll_panel(panel_box(f))
+        self._no_wall_rows = opened and not prices  # the list opened, read to the end: no 'Wall' row = all max
+        if not prices:
+            if panel_box(self.shot()):
+                self.tap(icon, 1.0)
+            return None
+        budget = getattr(self, "_wall_budget", None)
+        fits = [p for p in prices if budget is None or p <= budget]
+        self._wall_too_dear = None if fits else min(prices)
+        if not fits:  # not even one wall of the cheapest level: nothing to select
+            self.tap(icon, 1.0)
+            return None
+        want = min(fits)  # the cheapest level we can pay
+        # 2) back to the top, then down until that level's row is on screen - tapped where it is NOW
+        self.tap(icon, 1.0)
+        self.tap(icon, 1.3)
+        rows = []
+        for _ in range(16):
+            f = self.list_settled()
+            box = panel_box(f)
+            if not box:
+                break
+            rows = [r[3] for r in list_rows(f) if is_wall(r[0]) and r[1] == want and box[2] + 40 < r[3][1] < box[3] - 40]
+            if rows:
+                break
+            self.scroll_panel(box)
         if not rows:
             if panel_box(self.shot()):
                 self.tap(icon, 1.0)
             return None
-        for _ in range(6):  # wait until two reads agree on where the row is (the list glides after a swipe)
-            self.sleep(0.4)
-            again = self.find_wall_rows(self.shot())
-            if again and abs(again[0][1] - rows[0][1]) <= 4:
-                rows = again
-                break
-            rows = again or rows
-        # one 'Wall xN' row per level, not in price order ('Wall x112 1,500,000' above 'Wall x184 1,000,000'):
-        # take the cheapest affordable one. A row at the bottom edge may have another just under it - nudge up.
-        box = panel_box(self.shot())
-        if box and max(y for _, y in rows) > box[3] - 90:
-            cx = (box[0] + box[1]) // 2
-            self.adb.swipe(cx, box[3] - 60, cx, box[3] - 260, 700)
-            self.sleep(1.2)
-            rows = self.find_wall_rows(self.shot()) or rows
-        if len(rows) > 1:  # the cheapest affordable level first
-            rows = sorted(rows, key=lambda r: self._wall_price.get(r, 10 ** 12))
-        self._wall_unit = getattr(self, "_wall_price", {}).get(rows[0])  # one wall of that row (list price)
-        self._wall_unit = self._wall_unit if self._wall_unit and self._wall_unit < 10 ** 12 else None
+        self._wall_unit = want  # one wall of that row (list price)
         self.tap(rows[0], 1.2)
         f = self.shot()
         if panel_box(f):  # the list sometimes stays open over the buttons: its icon closes it
@@ -2392,7 +2437,12 @@ class Bot:
             balance = white_number(frame, region)
         for attempt in range(3):  # a slid list can land the tap on the wrong building: just try again
             # always a fresh pick from the list: a bar left from the last purchase holds walls a level higher now
+            self._wall_budget = balance
             more = self.select_wall(kind)
+            if getattr(self, "_wall_too_dear", None):
+                self.log(f"Walls: the cheapest wall level costs {self._wall_too_dear:,} - {cur} is {balance:,}, "
+                         "not enough yet.")
+                return False
             if more or self._no_wall_rows:  # no wall on the list at all: retrying won't help
                 break
             self.log(f"Wall upgrade: didn't get a wall selected (attempt {attempt + 1}/3) - retrying.")
@@ -3767,6 +3817,10 @@ class Bot:
             return False
         self.open_settings()
         sw = self.wait_for("switch_account_button", 5)
+        if not sw:  # not on the village when asked (a results screen, a popup...): once more from the village
+            self.back_to_village()
+            self.open_settings()
+            sw = self.wait_for("switch_account_button", 5)
         tag = settings_tag(self.shot()) if sw else None
         sc_of = self.cfg.setdefault("sc_of_tag", {})
         if tag and getattr(self, "_cur_sc", None):

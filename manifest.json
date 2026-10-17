@@ -1,7 +1,7 @@
 {
- "version": 73,
+ "version": 74,
  "files": {
-  "bot.py": "52454cccdec2d78e10988206c1aebab927b122a6ff07359d89d54072d09d22bc",
+  "bot.py": "18b789796c0bf87eb80f894511e7cc5c585207cea3bda0cae1398aba75f8044c",
   "setup.ps1": "3f4ed8e0b98b0fc30adf41469845bfef9c0f3fa68c5e7a0fc1d49e5a81cac766",
   "Setup.bat": "3d3ea502d691eccb7207f2d7388826a07c48f3f0c8eafa6c0a96df51b88bb8d3",
   "README.txt": "57d062e410301c98c6f86474af570802ccdbcc1a0723012e0e63ff2393dc6b08",
@@ -39,6 +39,7 @@
   "templates/goblin_gem_prompt.png": "e361e88915622387d00040f99bc4345e346413a14b5168ef1bf3e1f540073706",
   "templates/goblin_tab.png": "6d3a05719afc30c3d5cfafa6ed081aa0482658ac85e88cb69b21eff24325d8c9",
   "templates/guardians_title.png": "20f16208820f563177fdd8a451a400cd9c109c7731c5b5b5b8c93accfd18bb63",
+  "templates/hero_journey.png": "0da244879876082576b9d9592bc7bb17d121d79cc3821b3c3bc60b8b48d05dfa",
   "templates/lab_picker_title.png": "af3e133a745fc37d16bebbe4f57eb85b35d3a9800438995100ff70c73e4533cd",
   "templates/live_replay.png": "fc484eb88e6ea424ef1be55da311d39294dd2880cba68d6b8b1c691340cc00d3",
   "templates/loading_logo.png": "0bf0337189ffc3e06000b72cdce2c6b6086607e4b681021940aecb982b96cb88",
