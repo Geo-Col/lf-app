@@ -76,7 +76,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 74  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 75  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -3647,6 +3647,8 @@ class Bot:
             # the last, so it was read whole on the screen before
             if bot - top < 110 * k and not (bot >= H - 1 and bot - top >= 82 * k):
                 continue
+            if top < 500 * k:  # running into the header: partly hidden under it (the white merges with the card)
+                continue
             avatar = g[top:bot, int(1365 * k):int(1450 * k)]
             if avatar.size == 0 or avatar.mean() > 235:  # no avatar: the 'SWITCH ID' header, not an account
                 continue
@@ -3672,20 +3674,20 @@ class Bot:
         return rows or None
 
     def walk_accounts(self, stop=None):
-        """Scroll the Supercell ID panel to the top, then down card by card: every account once, in list order
-        (a card on two screens is matched by its look, not its OCR'd name). stop(row, index) -> True ends the walk
-        with that row on screen (its 'xy' is where it is now). Returns the rows seen."""
+        """Scroll the Supercell ID panel to the top, then down screen by screen: every account once, in list order.
+        Each card gets its place on the whole list (screen y + how far the list has scrolled), so two cards are
+        never mixed up whatever their names read as. How far a drag scrolled is measured, never assumed, and a
+        measurement only counts when the cards it lines up agree (same name + in-game name). stop(row, index) ->
+        True ends the walk with that row on screen (its 'xy' is where it is now). Returns the rows seen."""
         k = self.shot().shape[1] / 1920
         for _ in range(25):  # from the very top: the panel can open where it was last scrolled to
             self.adb.swipe(int(1620 * k), int(600 * k), int(1620 * k), int(1000 * k), 300)
         self.sleep(1.0)
-        seen, frame, offset = [], self.shot(), 0
         self._list_end = False
-        for _ in range(40):  # ~2.5 accounts per swipe: room for 100 (stops at the end of the list)
-            fresh = 0
-            for r in self.list_accounts(frame):
-                # where the card is on the whole list (screen y + how far the list has scrolled): each card is
-                # itself, whatever its name reads as - two 'Bob's, an emoji name, an OCR slip
+        seen, screens = [], []
+
+        def add(rows, offset):
+            for r in rows:
                 r["list_y"] = r["xy"][1] + offset
                 old = next((s for s in seen if abs(s["list_y"] - r["list_y"]) < 40 * k), None)
                 if old is not None:
@@ -3694,30 +3696,97 @@ class Bot:
                     old["xy"] = r["xy"]
                     continue
                 seen.append(r)
-                fresh += 1
                 if stop and stop(r, len(seen) - 1):
-                    return seen
-            if not fresh or self._list_end:
+                    return True
+            return False
+
+        frame = self.shot()
+        rows, offset, scale = self.list_accounts(frame), 0, 1.0
+        screens.append(frame)
+        if add(rows, 0):
+            return seen
+        for _ in range(60):  # ~2 accounts per drag: room for 100 (stops at the end of the list)
+            if self._list_end:
                 break
-            self.adb.swipe(int(1620 * k), int(960 * k), int(1620 * k), int(620 * k), 700)  # inside the panel
-            self.sleep(1.2)
-            prev, frame = frame, self.shot()
-            offset += self.list_shift(prev, frame)
+            moved = None
+            # a short drag inside the panel. If the list doesn't move, other drags (speeds) are tried before
+            # calling it the end: some PCs / emulators ignore a slow drag
+            for y1, y2, ms in ((960, 700, 900), (980, 700, 500), (980, 720, 250), (960, 720, 1400)):
+                y2 = y1 - (y1 - y2) * scale
+                self.adb.swipe(int(1620 * k), int(y1 * k), int(1620 * k), int(y2 * k), ms)
+                self.sleep(1.2)
+                f2 = self.shot()
+                r2 = self.list_accounts(f2)
+                d = self.list_shift(frame, f2, r2, offset, seen)
+                for _ in range(3):  # flung further than a screen (cards in between unseen): back, then shorter
+                    if d is not None or scale < 0.2:
+                        break
+                    self.adb.swipe(int(1620 * k), int(y2 * k), int(1620 * k), int(y1 * k), ms)
+                    self.sleep(1.2)
+                    f2 = self.shot()
+                    r2 = self.list_accounts(f2)
+                    d = self.list_shift(frame, f2, r2, offset, seen)
+                    scale /= 2
+                if d is None:  # still can't tell: line the screen up by a card it shares with one seen before
+                    norm = lambda s: re.sub(r"\W", "", (s or "").lower())
+                    same = next(((r, s) for r in r2 for s in seen
+                                 if norm(r["sc"] + r["game"]) and norm(r["sc"] + r["game"]) == norm(s["sc"] + s["game"])), None)
+                    d = (same[1]["list_y"] - same[0]["xy"][1] - offset) if same else None
+                if d is None or d != 0:
+                    moved = (d, f2, r2)
+                    break
+            if moved is None:  # nothing moves it: the bottom of the list
+                break
+            d, frame, rows = moved
+            screens.append(frame)
+            if d is None:  # no way to place this screen: keep its new cards after the ones seen (never drop them)
+                offset = max(s["list_y"] for s in seen) + int(144 * k) - min((r["xy"][1] for r in rows), default=0)
+            else:
+                offset += d
+            if add(rows, offset):
+                return seen
+        self._acc_screens = screens
+        if stop is None:
+            self.log(f"Account list: {len(seen)} account(s) read over {len(screens)} screen(s)"
+                     + ("" if self._list_end else " (list end not seen)") + ".")
+        try:  # what the bot saw (the panel of each screen, side by side) - for a debug report
+            strip = np.hstack([f[:, int(1320 * k):] for f in screens[:8]])
+            cv2.imwrite(os.path.join(BASE_DIR, "debug_accounts.png"), cv2.resize(strip, None, fx=0.5, fy=0.5))
+        except Exception:
+            pass
         return seen
 
     @staticmethod
-    def list_shift(a, b):
-        """How far the account list scrolled between two screenshots: the bottom of the old screen, found in the
-        new one. (A swipe never moves it the same amount twice - and not at all at the end of the list.)"""
+    def list_shift(a, b, rows_b=None, offset=0, seen=()):
+        """How far the account list scrolled from screenshot a to b, in pixels (+ = down the list), or None.
+        Candidates are the distances at which the two screens line up pixel for pixel (1.5+ cards overlapping);
+        one only counts if the cards it puts on top of each other agree - same name + in-game name - since plain
+        background lines up almost anywhere and look-alike cards line up one card away."""
         k = a.shape[1] / 1920
-        x0, x1 = int(1350 * k), int(1890 * k)
-        ga, gb = (cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in (a, b))
-        y0, y1 = int(860 * k), int(1040 * k)
-        res = cv2.matchTemplate(gb[int(492 * k):, x0:x1], ga[y0:y1, x0:x1], cv2.TM_CCOEFF_NORMED)
-        _, score, _, loc = cv2.minMaxLoc(res)
-        if score < 0.8:
-            return int(340 * k)  # couldn't tell: what the swipe asks for
-        return y0 - (loc[1] + int(492 * k))
+        x0, x1, top = int(1350 * k), int(1890 * k), int(500 * k)
+        ga, gb = (cv2.cvtColor(f[top:, x0:x1], cv2.COLOR_BGR2GRAY)[::2, ::2].astype(np.int16) for f in (a, b))
+        H, keep = ga.shape[0], int(240 * k) // 2
+        cand = []
+        for d in range(-(H - keep), H - keep):  # half-size rows
+            o1, o2 = (ga[d:], gb[:H - d]) if d >= 0 else (ga[:H + d], gb[-d:])
+            cand.append((float(np.abs(o1 - o2).mean()), d * 2))
+        cand = sorted(c for c in cand if c[0] < 5)[:8]
+        if not cand:
+            return None
+        if rows_b is None:
+            return cand[0][1]
+        norm = lambda s: re.sub(r"\W", "", (s or "").lower())
+        for _, d in cand:
+            pairs = [(r, s) for r in rows_b for s in seen
+                     if abs(s["list_y"] - (r["xy"][1] + offset + d)) < 40 * k]
+            ids = [(norm(r["sc"] + r["game"]), norm(s["sc"] + s["game"])) for r, s in pairs]
+            ids = [(x, y) for x, y in ids if x and y]
+            if ids and all(re.sub(r"\D", "", x) == re.sub(r"\D", "", y)  # 'Farm4' is never 'Farm3'
+                           and difflib.SequenceMatcher(None, x, y).ratio() >= 0.8 for x, y in ids):
+                return d
+            if d == 0 and not pairs and not rows_b:
+                return 0
+        return None
 
     @staticmethod
     def label_accounts(rows):
@@ -6722,7 +6791,8 @@ class App(tk.Tk):
                     files.append(("cloudflared.log", "".join(f.readlines()[-80:]).encode()))
             except OSError:
                 pass
-            for name in ("debug_deploy.png", "debug_wall.png", "debug_boat.png", "debug_export.png", "debug_upgrade.png"):
+            for name in ("debug_deploy.png", "debug_wall.png", "debug_boat.png", "debug_export.png", "debug_upgrade.png",
+                         "debug_accounts.png"):
                 path = os.path.join(BASE_DIR, name)
                 if os.path.exists(path) and time.time() - os.path.getmtime(path) < 6 * 3600:
                     img = cv2.imread(path)
