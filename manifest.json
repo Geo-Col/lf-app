@@ -1,7 +1,7 @@
 {
- "version": 75,
+ "version": 76,
  "files": {
-  "bot.py": "cbe6e5b7e68fd60208a5abfb9a8afbdf396ae84472be6f5389d0f6ad8cc13ee1",
+  "bot.py": "45c164963c579d1af1abb2834866ee2b23baee497ee32030bd1314d3451848b1",
   "setup.ps1": "3f4ed8e0b98b0fc30adf41469845bfef9c0f3fa68c5e7a0fc1d49e5a81cac766",
   "Setup.bat": "3d3ea502d691eccb7207f2d7388826a07c48f3f0c8eafa6c0a96df51b88bb8d3",
   "README.txt": "57d062e410301c98c6f86474af570802ccdbcc1a0723012e0e63ff2393dc6b08",
@@ -30,6 +30,7 @@
   "templates/chest_continue.png": "67dcea312d108caf0c600cf4d8cdfb835ec9764521cbd0cf2d0ff765f8f93d9c",
   "templates/chest_room.png": "e70db201fe3dcd9288a1a0d23ed90b904cff0bf84f9728643a277747824fbab1",
   "templates/chest_skip.png": "fe948caf191820141c8341b46d60d218ad50c60e1e21c4f7d3ac16edca8cac61",
+  "templates/coc_account_icon.png": "f94b68698c4a13eddf95a7e7b567b1dab89cdb425ebb322c6e6a97790afb6297",
   "templates/confirm_attack_button.png": "fb1bbd1a9b0ed4f4f68b4c5a3a13c40b682f1c7f6d6f6d4b1dd9cacb51faaff6",
   "templates/confirm_wall_upgrade_button.png": "705fb873b9fbd116496174fecf625ba4896b940ffb8841f1d02a1b2b7936b2f8",
   "templates/digits.png": "9a279d38a8fa776bd9b8647bc5fc27a317e3f1a180693aaa9293ec05917ec27d",

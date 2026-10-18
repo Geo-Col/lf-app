@@ -76,7 +76,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 75  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 76  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1372,7 +1372,9 @@ class Bot:
         # misreads snap to these: tagged accounts, accounts with saved scans, the Supercell ID list's names
         self._names = list(dict.fromkeys([*(cfg.get("account_tags") or {}).values(),
                                           *(k.split(" (")[0] for k in (cfg.get("scans") or {})),
-                                          *(a["sc"] for a in cfg.get("sc_accounts") or [] if a.get("sc"))]))
+                                          *(a["sc"] for a in cfg.get("sc_accounts") or [] if a.get("sc")),
+                                          *(a["game"] for a in cfg.get("sc_accounts") or []
+                                            if len(re.sub(r"\W", "", a.get("game") or "")) >= 3)]))
         self._saving_home = None  # account farming for its next home plan target: no Builder Base trips meanwhile
         self._bb_saving = None  # resource the Builder Base plan is saving up (the Star Lab leaves it alone)
         self._view = None  # background zoom + pan for the base being scouted
@@ -3625,37 +3627,35 @@ class Bot:
         return rows
 
     def account_cards(self, frame):
-        """The card reader for list_accounts(); None if no cards are found (then its word search is used)."""
+        """The card reader for list_accounts(); None if no cards are found (then its word search is used).
+        Every account card has the small Clash of Clans logo before its in-game name, and nothing else on the
+        panel does (header, divider, 'Log in to Supercell ID'): each logo found = one account, and the card's
+        lines sit at fixed places around it - name above, in-game name beside it, Town Hall below."""
         k = frame.shape[1] / 1920
         g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        col = g[:, int(1700 * k)].astype(int)  # cards are pure white, the gaps between them light grey
-        H, rows, y, prev_bot = len(col), [], int(380 * k), None
-        self._list_end = False
-        while y < H:
-            if col[y] < 250:
-                y += 1
-                continue
-            top = y
-            if prev_bot is not None and top - prev_bot > 50 * k:  # the 'OTHER IDS' divider: the accounts end here
-                self._list_end = True                              # ('Log in to Supercell ID' is below it)
+        H = g.shape[0]
+        t = self.v.template("coc_account_icon")
+        if t is None:
+            return None
+        icon = cv2.resize(cv2.imread(os.path.join(TEMPLATE_DIR, "coc_account_icon.png")), None, fx=k, fy=k)
+        x0, x1 = int(1400 * k), int(1560 * k)
+        res = cv2.matchTemplate(frame[:, x0:x1], icon, cv2.TM_CCOEFF_NORMED)
+        hits = []
+        while True:
+            _, v, _, loc = cv2.minMaxLoc(res)
+            if v < 0.75:
                 break
-            while y < H and col[y] >= 250:
-                y += 1
-            bot = y
-            # a whole card, or one cut off by the bottom edge with its name + in-game name showing. One cut off at
-            # the top (sliding under the header) would have its lower lines read as the name - every swipe overlaps
-            # the last, so it was read whole on the screen before
-            if bot - top < 110 * k and not (bot >= H - 1 and bot - top >= 82 * k):
+            hits.append((x0 + loc[0] + icon.shape[1] // 2, loc[1] + icon.shape[0] // 2))
+            res[max(0, loc[1] - int(40 * k)):loc[1] + int(40 * k), :] = -1  # one logo per card row
+        rows = []
+        for cx, cy in sorted(hits, key=lambda h: h[1]):
+            top = cy - int(61 * k)  # the card's top edge (measured: logo centre is 61 px below it)
+            if top < int(495 * k):  # its name line is under the panel's header: read whole on another screen
                 continue
-            if top < 500 * k:  # running into the header: partly hidden under it (the white merges with the card)
-                continue
-            avatar = g[top:bot, int(1365 * k):int(1450 * k)]
-            if avatar.size == 0 or avatar.mean() > 235:  # no avatar: the 'SWITCH ID' header, not an account
-                continue
-            prev_bot = bot
-            line = lambda a, b, x0, cfg: (pytesseract.image_to_string(cv2.resize(
-                g[top + int(a * k):min(H, top + int(b * k)), int(x0 * k):int(1790 * k)], None, fx=2, fy=2,
-                interpolation=cv2.INTER_CUBIC), config=cfg, timeout=5).strip() if top + int(a * k) < H else "")
+            line = lambda a, b, lx, cfg: (pytesseract.image_to_string(cv2.resize(
+                g[top + int(a * k):min(H, top + int(b * k)), int(lx * k):int(1790 * k)], None, fx=2, fy=2,
+                interpolation=cv2.INTER_CUBIC), config=cfg, timeout=5).strip() if top + int(b * k) <= H + 8 * k
+                else "")
             try:
                 name = line(16, 54, 1458, "--psm 7")
                 game = line(46, 78, 1498, "--psm 7")
@@ -3666,30 +3666,57 @@ class Bot:
             game = re.sub(r"\s+", " ", game).strip(" |_-.,'\"~*><")
             if len(re.sub(r"\W", "", name)) < 2:  # emoji / another alphabet: unreadable, not a name
                 name = ""
-            # the card's look (avatar + name + in-game name): tells cards apart even when the names read the same
-            # or can't be read at all (emoji, other alphabets) - and the same card on two screens matches
-            fp = g[top:top + int(80 * k), int(1350 * k):int(1790 * k)].astype(np.int16)  # full size: one digit counts
+            av = cv2.resize(g[top + int(12 * k):top + int(70 * k), int(1365 * k):int(1450 * k)], (24, 16),
+                            interpolation=cv2.INTER_AREA).astype(np.float32)  # the avatar's top (always showing)
             rows.append({"sc": name, "game": game, "th": int(th.group(1)) if th and int(th.group(1)) <= 20 else None,
-                         "xy": (int(1520 * k), top + int(35 * k)), "fp": fp})
+                         "xy": (int(1520 * k), top + int(35 * k)), "av": av})
+        # the end of the list: the 'OTHER IDS' divider - a wide grey gap (2+ cards' worth of no logo) right under
+        # the last logo, before the screen's bottom
+        col = g[:, int(1700 * k)].astype(int)
+        self._list_end = False
+        if hits:
+            last = max(h[1] for h in hits) + int(61 * k)  # roughly the last card's bottom edge
+            y = last
+            while y < H and col[y] >= 250:
+                y += 1
+            gap = y
+            while gap < H and col[gap] < 250:
+                gap += 1
+            self._list_end = gap < H and gap - y > 50 * k
         return rows or None
 
+    @staticmethod
+    def same_card(a, b):
+        """Two account cards (read on different screens) are the same account: name + in-game name read alike
+        with exactly the same numbers ('Spenner1610' vs 'SPENCER1610' read alike, but their Town Halls / avatars
+        differ), the same Town Hall when both show it, and the same avatar."""
+        norm = lambda r: re.sub(r"\W", "", f"{r.get('sc') or r.get('name') or ''}{r.get('game') or ''}".lower())
+        x, y = norm(a), norm(b)
+        if re.sub(r"\D", "", x) != re.sub(r"\D", "", y) or difflib.SequenceMatcher(None, x, y).ratio() < 0.9:
+            return False
+        if a.get("th") and b.get("th") and a["th"] != b["th"]:
+            return False
+        if a.get("av") is not None and b.get("av") is not None and float(np.abs(a["av"] - b["av"]).mean()) > 30:
+            return False
+        return True
+
     def walk_accounts(self, stop=None):
-        """Scroll the Supercell ID panel to the top, then down screen by screen: every account once, in list order.
-        Each card gets its place on the whole list (screen y + how far the list has scrolled), so two cards are
-        never mixed up whatever their names read as. How far a drag scrolled is measured, never assumed, and a
-        measurement only counts when the cards it lines up agree (same name + in-game name). stop(row, index) ->
-        True ends the walk with that row on screen (its 'xy' is where it is now). Returns the rows seen."""
+        """Scroll the Supercell ID panel to the top, then down screen by screen until it stops moving: every
+        account once, in list order. Each card is recognised by what it IS (name, in-game name, Town Hall, avatar)
+        - nothing depends on how far a drag scrolled, which look-alike cards make impossible to measure reliably.
+        stop(row, index) -> True ends the walk with that row on screen ('xy' = where it is now)."""
         k = self.shot().shape[1] / 1920
         for _ in range(25):  # from the very top: the panel can open where it was last scrolled to
             self.adb.swipe(int(1620 * k), int(600 * k), int(1620 * k), int(1000 * k), 300)
         self.sleep(1.0)
         self._list_end = False
         seen, screens = [], []
-
-        def add(rows, offset):
-            for r in rows:
-                r["list_y"] = r["xy"][1] + offset
-                old = next((s for s in seen if abs(s["list_y"] - r["list_y"]) < 40 * k), None)
+        panel = lambda f: cv2.cvtColor(f[int(500 * k):, int(1350 * k):int(1890 * k)], cv2.COLOR_BGR2GRAY)[::2, ::2]
+        frame = self.shot()
+        for _ in range(80):  # ~2 accounts per drag: room for 100+ (stops when the list stops moving)
+            screens.append(frame)
+            for r in self.list_accounts(frame):
+                old = next((s for s in seen if self.same_card(s, r)), None)
                 if old is not None:
                     if old["th"] is None and r["th"] is not None:  # first seen cut off at the bottom
                         old["th"] = r["th"]
@@ -3697,96 +3724,31 @@ class Bot:
                     continue
                 seen.append(r)
                 if stop and stop(r, len(seen) - 1):
-                    return True
-            return False
-
-        frame = self.shot()
-        rows, offset, scale = self.list_accounts(frame), 0, 1.0
-        screens.append(frame)
-        if add(rows, 0):
-            return seen
-        for _ in range(60):  # ~2 accounts per drag: room for 100 (stops at the end of the list)
-            if self._list_end:
+                    return seen
+            if self._list_end:  # the 'OTHER IDS' divider is on screen: that was the last account
                 break
-            moved = None
-            # a short drag inside the panel. If the list doesn't move, other drags (speeds) are tried before
-            # calling it the end: some PCs / emulators ignore a slow drag
+            # a short drag inside the panel (the next screen overlaps this one, so no card is skipped). If the
+            # list doesn't move, other speeds are tried before calling it the bottom: some PCs ignore slow drags
+            moved = False
             for y1, y2, ms in ((960, 700, 900), (980, 700, 500), (980, 720, 250), (960, 720, 1400)):
-                y2 = y1 - (y1 - y2) * scale
                 self.adb.swipe(int(1620 * k), int(y1 * k), int(1620 * k), int(y2 * k), ms)
                 self.sleep(1.2)
                 f2 = self.shot()
-                r2 = self.list_accounts(f2)
-                d = self.list_shift(frame, f2, r2, offset, seen)
-                for _ in range(3):  # flung further than a screen (cards in between unseen): back, then shorter
-                    if d is not None or scale < 0.2:
-                        break
-                    self.adb.swipe(int(1620 * k), int(y2 * k), int(1620 * k), int(y1 * k), ms)
-                    self.sleep(1.2)
-                    f2 = self.shot()
-                    r2 = self.list_accounts(f2)
-                    d = self.list_shift(frame, f2, r2, offset, seen)
-                    scale /= 2
-                if d is None:  # still can't tell: line the screen up by a card it shares with one seen before
-                    norm = lambda s: re.sub(r"\W", "", (s or "").lower())
-                    same = next(((r, s) for r in r2 for s in seen
-                                 if norm(r["sc"] + r["game"]) and norm(r["sc"] + r["game"]) == norm(s["sc"] + s["game"])), None)
-                    d = (same[1]["list_y"] - same[0]["xy"][1] - offset) if same else None
-                if d is None or d != 0:
-                    moved = (d, f2, r2)
+                if float(cv2.absdiff(panel(frame), panel(f2)).mean()) > 1.0:
+                    frame, moved = f2, True
                     break
-            if moved is None:  # nothing moves it: the bottom of the list
+            if not moved:  # nothing moves it: the bottom of the list
                 break
-            d, frame, rows = moved
-            screens.append(frame)
-            if d is None:  # no way to place this screen: keep its new cards after the ones seen (never drop them)
-                offset = max(s["list_y"] for s in seen) + int(144 * k) - min((r["xy"][1] for r in rows), default=0)
-            else:
-                offset += d
-            if add(rows, offset):
-                return seen
         self._acc_screens = screens
         if stop is None:
             self.log(f"Account list: {len(seen)} account(s) read over {len(screens)} screen(s)"
                      + ("" if self._list_end else " (list end not seen)") + ".")
-        try:  # what the bot saw (the panel of each screen, side by side) - for a debug report
-            strip = np.hstack([f[:, int(1320 * k):] for f in screens[:8]])
-            cv2.imwrite(os.path.join(BASE_DIR, "debug_accounts.png"), cv2.resize(strip, None, fx=0.5, fy=0.5))
-        except Exception:
-            pass
+            try:  # what the bot saw (the panel of each screen, side by side) - for a debug report
+                strip = np.hstack([f[:, int(1320 * k):] for f in screens[:10]])
+                cv2.imwrite(os.path.join(BASE_DIR, "debug_accounts.png"), cv2.resize(strip, None, fx=0.5, fy=0.5))
+            except Exception:
+                pass
         return seen
-
-    @staticmethod
-    def list_shift(a, b, rows_b=None, offset=0, seen=()):
-        """How far the account list scrolled from screenshot a to b, in pixels (+ = down the list), or None.
-        Candidates are the distances at which the two screens line up pixel for pixel (1.5+ cards overlapping);
-        one only counts if the cards it puts on top of each other agree - same name + in-game name - since plain
-        background lines up almost anywhere and look-alike cards line up one card away."""
-        k = a.shape[1] / 1920
-        x0, x1, top = int(1350 * k), int(1890 * k), int(500 * k)
-        ga, gb = (cv2.cvtColor(f[top:, x0:x1], cv2.COLOR_BGR2GRAY)[::2, ::2].astype(np.int16) for f in (a, b))
-        H, keep = ga.shape[0], int(240 * k) // 2
-        cand = []
-        for d in range(-(H - keep), H - keep):  # half-size rows
-            o1, o2 = (ga[d:], gb[:H - d]) if d >= 0 else (ga[:H + d], gb[-d:])
-            cand.append((float(np.abs(o1 - o2).mean()), d * 2))
-        cand = sorted(c for c in cand if c[0] < 5)[:8]
-        if not cand:
-            return None
-        if rows_b is None:
-            return cand[0][1]
-        norm = lambda s: re.sub(r"\W", "", (s or "").lower())
-        for _, d in cand:
-            pairs = [(r, s) for r in rows_b for s in seen
-                     if abs(s["list_y"] - (r["xy"][1] + offset + d)) < 40 * k]
-            ids = [(norm(r["sc"] + r["game"]), norm(s["sc"] + s["game"])) for r, s in pairs]
-            ids = [(x, y) for x, y in ids if x and y]
-            if ids and all(re.sub(r"\D", "", x) == re.sub(r"\D", "", y)  # 'Farm4' is never 'Farm3'
-                           and difflib.SequenceMatcher(None, x, y).ratio() >= 0.8 for x, y in ids):
-                return d
-            if d == 0 and not pairs and not rows_b:
-                return 0
-        return None
 
     @staticmethod
     def label_accounts(rows):
@@ -3808,6 +3770,11 @@ class Bot:
         """Every account on the Supercell ID panel, top to bottom (scrolling for long lists), each with a unique
         'sc' label and its 'pos' on the list. Saved for the phone view's account picker."""
         seen = self.walk_accounts()
+        for _ in range(2):  # nothing yet: the panel's cards load a moment after it opens - look again
+            if seen:
+                break
+            self.sleep(2.5)
+            seen = self.walk_accounts()
         for r, lab, i in zip(seen, self.label_accounts(seen), range(len(seen))):
             r["name"], r["sc"], r["pos"] = r["sc"], lab, i
         known = [{"sc": r["sc"], "name": r["name"], "game": r["game"], "th": r["th"], "pos": r["pos"]} for r in seen]
@@ -3822,24 +3789,37 @@ class Bot:
         return seen
 
     def tap_account(self, sc):
-        """Tap an account on the Supercell ID panel: the card at its saved place on the list (checked against its
-        name / in-game name), else the first card whose name matches."""
+        """Tap an account on the Supercell ID panel: the card that is that saved account (name, in-game name,
+        Town Hall - see same_card), found by scrolling the list from the top."""
         norm = lambda s: re.sub(r"\W", "", (s or "").lower())
-        acc = next((a for a in self.cfg.get("sc_accounts") or [] if norm(a.get("sc")) == norm(sc)), None)
-        like = lambda r: acc is not None and ((acc.get("name") is not None and norm(r["sc"]) == norm(acc["name"])
-                                              and (not acc.get("game") or norm(r["game"]) == norm(acc["game"])))
-                                             or (norm(r["game"]) and norm(r["game"]) == norm(acc.get("game"))
-                                                 and r["th"] == acc.get("th")))
-        hit = []
+        saved = self.cfg.get("sc_accounts") or []
+        acc = next((a for a in saved if norm(a.get("sc")) == norm(sc)), None)
+        want = {"sc": (acc.get("name") if acc and acc.get("name") is not None else sc), "game": (acc or {}).get("game"),
+                "th": (acc or {}).get("th")}
+        if acc and not want["sc"] and not want["game"]:
+            want = None  # nothing readable to recognise it by: its place on the list
+        # accounts that look exactly like it and come before it on the list: skip that many matches
+        twins = sum(1 for a in saved[:saved.index(acc)] if want and self.same_card(
+            {"sc": a.get("name") if a.get("name") is not None else a["sc"], "game": a.get("game"), "th": a.get("th")},
+            want)) if acc else 0
+        hit, count = [], [0]
 
         def at(r, i):
-            if (acc is not None and i == acc.get("pos") and like(r)) or (acc is None and norm(r["sc"]) == norm(sc)):
+            if want is None:
+                ok = i == acc.get("pos")
+            elif self.same_card(r, want):
+                count[0] += 1
+                ok = count[0] > twins
+            else:
+                ok = False
+            if ok:
                 hit.append(r)
-                return True
-            return False
+            return ok
         self.walk_accounts(at)
-        if not hit and acc is not None:  # the list changed since it was saved: find it by name instead
-            self.walk_accounts(lambda r, i: like(r) and (hit.append(r) or True))
+        if not hit:  # the cards may not have loaded yet when the panel opened: once more
+            self.sleep(2.5)
+            count[0] = 0
+            self.walk_accounts(at)
         if hit:
             self.tap(hit[0]["xy"], 4.0)
             return True
@@ -3905,7 +3885,8 @@ class Bot:
             return self.switch_fail("Supercell ID list didn't open")
         rows = self.all_accounts()
         if target:
-            idx = next((i for i, r in enumerate(rows) if r["sc"] == target), None)
+            nm = lambda x: re.sub(r"\W", "", (x or "").lower())  # a re-read can change 'S' to 's'
+            idx = next((i for i, r in enumerate(rows) if nm(r["sc"]) == nm(target)), None)
             if idx is None:
                 return self.switch_fail(f"{target} isn't on the Supercell ID list")
             self._acc_idx, self._switch_streak = idx - 1, -1  # the pick below lands on it; a fresh rotation
@@ -3949,7 +3930,7 @@ class Bot:
         if not self.tap_account(name):
             return self.switch_fail(f"couldn't find {name} on the Supercell ID list")
         self._cur_sc = name
-        end, backs = time.time() + 75, 0
+        end, backs = time.time() + 120, 0  # a slow PC / big village can take a while to load
         while time.time() < end:
             f = self.shot()
             if self.at_village(f):  # home OR Builder Base: an account opens on whichever village it was left on
@@ -3972,9 +3953,9 @@ class Bot:
                 self.emit("state", f"Home village ({self._last_name})")
                 self.emit("scan", self._last_name)  # the Walls card puts this account first
                 return True
-            if self.tutorial(f) or self.event_chest(f) or self.close_popup(f):
+            if self.tutorial(f) or self.hero_journey(f) or self.event_chest(f) or self.close_popup(f):
                 continue
-            if self.find(f, "wall_okay_button") or time.time() > end - 60 + 6 * (backs + 1):
+            if self.find(f, "wall_okay_button") or time.time() > end - 105 + 6 * (backs + 1):
                 if backs >= 2 and backs % 2 == 0 and self.groq_on("groq_supervisor"):
                     self.groq_rescue(f)  # e.g. an event character's speech bubble: a tap moves it on, Back doesn't
                 else:
@@ -6469,7 +6450,8 @@ class App(tk.Tk):
                 self.bg(lambda: Bot(self.cfg, self.adb, self.emit, mode).read_accounts())
         elif a == "switch_account":
             sc = c.get("account")
-            if sc not in [x["sc"] for x in self.cfg.get("sc_accounts") or []]:
+            nm = lambda x: re.sub(r"\W", "", (x or "").lower())
+            if not isinstance(sc, str) or nm(sc) not in [nm(x["sc"]) for x in self.cfg.get("sc_accounts") or []]:
                 return self.log("📱 Phone: switch - that account isn't on the saved list.", "warn")
             self.log(f"📱 Phone: switch to {sc} (at the next village screen).", "ok")
             if not running:
