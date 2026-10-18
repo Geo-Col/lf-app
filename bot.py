@@ -39,7 +39,6 @@ import difflib
 import glob
 import hashlib
 import http.server
-import io
 import json
 import logging
 import logging.handlers
@@ -76,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 77  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 78  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -998,21 +997,6 @@ def troop_bar(frame):
     return out
 
 
-def confirm_price(frame, hit):
-    """Price on the upgrade window's green Confirm (hit = its 'Confirm' label). White normally; yellow when a
-    discount applies - then the old price is printed struck-out underneath, so only the line right under the
-    label is read."""
-    k = frame.shape[1] / 1920
-    v = white_number(frame, (hit[0] - int(160 * k), hit[1] + int(12 * k), hit[0] + int(130 * k), hit[1] + int(75 * k)))
-    if v:
-        return v
-    c = crop(frame, (hit[0] - int(160 * k), hit[1] + int(8 * k), hit[0] + int(130 * k), hit[1] + int(56 * k)), 0)
-    if c is None:
-        return None
-    hsv = cv2.cvtColor(c, cv2.COLOR_BGR2HSV)
-    return read_digit_blobs((hsv[:, :, 0] >= 18) & (hsv[:, :, 0] <= 35) & (hsv[:, :, 1] > 120) & (hsv[:, :, 2] > 200))
-
-
 # Built-in categories (lower-case, matched fuzzily). Anything not here is 'other'.
 UPGRADE_CATEGORIES = {
     "heroes": ["barbarian king", "archer queen", "grand warden", "royal champion", "minion prince", "dragon duke", "hero hall",
@@ -1655,21 +1639,34 @@ class Bot:
         return storage
 
     def note_full(self, name, gain, now):
-        """After an attack: gold, elixir AND dark elixir all unchanged (an attack on a base with loot always adds
-        some) = every storage is full. Dark is only required when it could be read."""
+        """After an attack: a storage that barely rose (under 5% of the loot the base had) is full. Only real attacks
+        count (troops got in - not a search given up, nor 0% damage), each storage must stay unchanged after 2
+        such attacks (an early read while the loot still counts up proves nothing) and stays full until it rises
+        again, so a base short of gold can still prove elixir. Full = gold, elixir AND dark elixir (dark only
+        when it can be read)."""
         offered, self._offered = getattr(self, "_offered", None), None
-        if offered and None not in offered and sum(offered) < 200_000:
-            return  # an almost empty base proves nothing
-        same = [g <= 1000 for g in gain[:2]] + ([gain[2] <= 50] if now[2] is not None else [])
+        dmg, self._dmg = getattr(self, "_dmg", None), None
+        if offered is None or (dmg is not None and dmg < 10):
+            return  # no attack since the last look, or the troops never got in: no loot either way
+        seen = self.__dict__.setdefault("_full_n", {}).setdefault(name, [0, 0, 0])
+        for i, (g, offer) in enumerate(zip(gain, (*offered, None))):
+            if i == 2 and now[2] is None:
+                continue
+            if g > (200 if i == 2 else max(1000, (offer or 0) // 20)):  # rose by 5%+ of what the base had
+                seen[i] = 0
+            elif offer is None or offer >= 50_000:  # (a base with almost none of it proves nothing)
+                seen[i] += 1
+        same = [seen[0] >= 2, seen[1] >= 2, seen[2] >= 2 or now[2] is None]
         full = self.__dict__.setdefault("_full", {})
         full[name] = all(same)
         if full[name]:
-            self.log(f"{name}: gold, elixir and dark elixir didn't change after that attack - storages are full.",
+            self.log(f"{name}: gold, elixir and dark elixir barely rose after 2 attacks - storages are full.",
                      "ok")
-        elif any(same) and self.__dict__.setdefault("_part", {}).get(name) != same:
-            self._part[name] = same  # (said once - not after every attack)
-            self.log(f"{name}: {', '.join(c for c, s in zip(('gold', 'elixir', 'dark elixir'), same) if s)} full - "
-                     "farming on until all three are.")
+        elif self.__dict__.setdefault("_part", {}).get(name) != same:
+            self._part[name] = same  # (said once per change - not after every attack)
+            if any(same):
+                self.log(f"{name}: {', '.join(c for c, s in zip(('gold', 'elixir', 'dark elixir'), same) if s)} "
+                         "full - farming on until all three are.")
 
     def storages_full(self, name):
         return self.__dict__.get("_full", {}).get(name, False)
@@ -1690,6 +1687,18 @@ class Bot:
         self.tap((int(1518 * k), int(90 * k)), delay)
         if not self.find(self.shot(), "switch_account_button"):  # the profile window was slow: its tab once more
             self.tap((int(1518 * k), int(90 * k)), delay)
+
+    def switch_button(self):
+        """Profile -> Settings -> the blue switch-account button (where it is), or None. Not on the village when
+        asked (a results screen, a popup...): once more from the village."""
+        for i in range(2):
+            if i:
+                self.back_to_village()
+            self.open_settings()
+            sw = self.wait_for("switch_account_button", 5)
+            if sw:
+                return sw
+        return None
 
     def tutorial(self, frame):
         """The game's one-off tutorials after the redesign (the Builder Menu, 'Settings has moved'...): the guide
@@ -1715,13 +1724,7 @@ class Bot:
     def read_accounts(self):
         """Open the Supercell ID list just to note the accounts on it (for the phone view's picker), then close it."""
         self.back_to_village()
-        f = self.shot()
-        self.open_settings()
-        sw = self.wait_for("switch_account_button", 5)
-        if not sw:  # not on the village when asked (a results screen, a popup...): once more from the village
-            self.back_to_village()
-            self.open_settings()
-            sw = self.wait_for("switch_account_button", 5)
+        sw = self.switch_button()
         if sw:
             self.tap(sw, 2.5)
             if self.wait_for("supercell_id_header", 6):
@@ -1737,13 +1740,14 @@ class Bot:
 
     def phone_switch(self):
         """An account picked on the phone view: switch now (we're on a village). True if one was waiting."""
-        if getattr(self, "list_req", False):
-            self.list_req = False
-            self.read_accounts()
-            return True
         sc, self.switch_req = getattr(self, "switch_req", None), None
         if not sc:
+            if getattr(self, "list_req", False):
+                self.list_req = False
+                self.read_accounts()
+                return True
             return False
+        self.list_req = False  # the switch reads the list anyway
         self.log(f"Phone: switching to {sc}.", "ok")
         self.switch_account(target=sc)
         return True
@@ -1786,7 +1790,8 @@ class Bot:
                             if self.same_game_name(x.get("game") or "", re.sub(r" \(.*\)$", "", name))]
                     label = hits[0] if len(hits) == 1 else name
                 self._full_done = getattr(self, "_full_done", set()) | {label}
-                if self._n_accounts and len(self._full_done) >= self._n_accounts:
+                if self._n_accounts and len(self._full_done & getattr(self, "_rot_labels", self._full_done)) \
+                        >= self._n_accounts:
                     self.log("Every account's storages are full - nothing left to farm. Stopping.", "ok")
                     self.stop_evt.set()
                     raise Abort()
@@ -2044,6 +2049,7 @@ class Bot:
     # --- attacking ---
     def attack(self, gold, elixir):
         self._offered = (gold, elixir)  # what the base had: a storage that then barely rises is full
+        self._dmg = None  # the damage done (finish_battle): 0% = the troops never got in
         loot = f" - gold {gold:,} / elixir {elixir:,}" if gold is not None and elixir is not None else ""
         self.log(f"Attacking{loot}", "ok")
         self.bump("attacks")
@@ -2091,6 +2097,7 @@ class Bot:
                     return True
                 break
         self.log("Couldn't read the troop bar - no troops deployed (see debug_deploy.png).", "err")
+        self._dmg = 0
         return True  # in a battle we can't use: finish_battle surrenders it
 
     def finish_battle(self):
@@ -2119,7 +2126,7 @@ class Bot:
                 last_read = time.time()
                 if dmg > best:
                     last_rise = last_read
-                best = max(best, dmg)
+                best = self._dmg = max(best, dmg)
                 streak = streak + 1 if dmg >= c["surrender_damage_threshold"] else 0
                 self.emit("state", f"In battle - {dmg}% damage")
                 if streak >= c["damage_confirm_count"]:
@@ -2305,13 +2312,6 @@ class Bot:
                 return f
             prev = roi
             self.sleep(0.3)
-
-    def find_wall_rows(self, frame):
-        """'Wall' rows in the open builder list, via Tesseract word search (clean white-on-dark text). Only inside
-        the list: a selected wall's own bar says 'Remove Wall' / 'Add Wall', and those must never be tapped."""
-        rows = [r for r in list_rows(frame) if is_wall(r[0])]
-        self._wall_price = {r[3]: r[1] for r in rows}  # (red = not enough GOLD - an elixir buy can still pay it)
-        return [r[3] for r in rows]
 
     def wall_fail(self, why, frame):
         cv2.imwrite(os.path.join(BASE_DIR, "debug_wall.png"), frame)
@@ -2748,7 +2748,7 @@ class Bot:
             done = self.find(f, "bb_return_home")
             if done:
                 self.tap(done, 3.0)
-                if not self.wait_for("bb_attack_button", 15):
+                if not self.bb_home():
                     return None
                 if self.mode.startswith("bb_"):  # the session's Builder Base loot / hour: storage after every battle
                     self.sleep(1.5)
@@ -2759,6 +2759,18 @@ class Bot:
             # Tapping an already-deployed card is harmless (the Battle Machine's = its ability).
             self.bb_deploy([c for c in troop_bar(f) if c[2] in ("hero", "single", "troop")])
         self.log("Builder Base: battle didn't finish in time.", "warn")
+
+    def bb_home(self, timeout=15):
+        """Wait for the Builder Base village (its Attack button), closing news / event popups that land on it
+        after a battle ('Town Hall Cup Finals'...). The button's place, or None."""
+        end = time.time() + timeout
+        while True:
+            f = self.shot()
+            hit = self.find(f, "bb_attack_button")
+            if hit or time.time() > end:
+                return hit
+            if not (self.close_popup(f) or self.event_chest(f) or self.hero_journey(f)):
+                self.sleep(0.8)
 
     def bb_deploy(self, cards):
         a, b = (390, 380), (260, 600)  # left edge of the map: always outside the base, clear of the Boost buttons
@@ -2842,15 +2854,14 @@ class Bot:
                 break
             if self.bb_bonus(name):
                 last = None  # the counter restarts after a bonus: that's not a 'rolled over without one'
-            f = self.shot()
-            if not self.find(f, "bb_attack_button"):  # still in a battle / its end screen: never press Back here
+            if not self.bb_home(3):  # still in a battle / its end screen: never press Back here
                 done = self.wait_for("bb_return_home", 240, poll=3)
                 if done:
                     self.tap(done, 3.0)
-                if not self.wait_for("bb_attack_button", 15):
+                if not self.bb_home():
                     self.log("Builder Base: not back on the village - stopping the attacks.", "warn")
                     break
-                f = self.shot()
+            f = self.shot()
             st = self.bb_stars(f)
             if not st:  # the counter disappears from the Attack button once today's bonuses are all used
                 if name != "?":
@@ -3711,14 +3722,20 @@ class Bot:
         account once, in list order. Each card is recognised by what it IS (name, in-game name, Town Hall, avatar)
         - nothing depends on how far a drag scrolled, which look-alike cards make impossible to measure reliably.
         stop(row, index) -> True ends the walk with that row on screen ('xy' = where it is now)."""
-        k = self.shot().shape[1] / 1920
-        for _ in range(25):  # from the very top: the panel can open where it was last scrolled to
-            self.adb.swipe(int(1620 * k), int(600 * k), int(1620 * k), int(1000 * k), 300)
-        self.sleep(1.0)
+        frame = self.shot()
+        k = frame.shape[1] / 1920
+        panel = lambda f: cv2.cvtColor(f[int(500 * k):, int(1350 * k):int(1890 * k)], cv2.COLOR_BGR2GRAY)[::2, ::2]
+        for _ in range(8):  # from the very top: the panel can open where it was last scrolled to
+            for _ in range(4):
+                self.adb.swipe(int(1620 * k), int(600 * k), int(1620 * k), int(1000 * k), 300)
+            self.sleep(1.0)
+            f2 = self.shot()
+            if float(cv2.absdiff(panel(frame), panel(f2)).mean()) <= 1.0:
+                break  # 4 drags up didn't move it: the top
+            frame = f2
+        frame = f2
         self._list_end = False
         seen, screens = [], []
-        panel = lambda f: cv2.cvtColor(f[int(500 * k):, int(1350 * k):int(1890 * k)], cv2.COLOR_BGR2GRAY)[::2, ::2]
-        frame = self.shot()
         for _ in range(80):  # ~2 accounts per drag: room for 100+ (stops when the list stops moving)
             screens.append(frame)
             for r in self.list_accounts(frame):
@@ -3745,7 +3762,6 @@ class Bot:
                     break
             if not moved:  # nothing moves it: the bottom of the list
                 break
-        self._acc_screens = screens
         if stop is None:
             self.log(f"Account list: {len(seen)} account(s) read over {len(screens)} screen(s)"
                      + ("" if self._list_end else " (list end not seen)") + ".")
@@ -3781,7 +3797,15 @@ class Bot:
                 break
             self.sleep(2.5)
             seen = self.walk_accounts()
-        for r, lab, i in zip(seen, self.label_accounts(seen), range(len(seen))):
+        saved = self.cfg.get("sc_accounts") or []
+        labels, used = self.label_accounts(seen), set()
+        for i, r in enumerate(seen):
+            old = [a["sc"] for a in saved if self.same_card(r, {"sc": a.get("name", a["sc"]), "game": a.get("game"),
+                                                                "th": a.get("th")})]
+            lab = old[0] if len(old) == 1 and old[0] not in used else labels[i]
+            while lab in used:  # (never two accounts with one label)
+                lab += " #2"
+            used.add(lab)
             r["name"], r["sc"], r["pos"] = r["sc"], lab, i
         known = [{"sc": r["sc"], "name": r["name"], "game": r["game"], "th": r["th"], "pos": r["pos"]} for r in seen]
         if known and not self._list_end:  # didn't get to the bottom: keep accounts saved before that weren't seen
@@ -3808,6 +3832,11 @@ class Bot:
         twins = sum(1 for a in saved[:saved.index(acc)] if want and self.same_card(
             {"sc": a.get("name") if a.get("name") is not None else a["sc"], "game": a.get("game"), "th": a.get("th")},
             want)) if acc else 0
+        if want is not None and not twins:
+            r = next((r for r in self.list_accounts(self.shot()) if self.same_card(r, want)), None)
+            if r:
+                self.tap(r["xy"], 4.0)
+                return True
         hit, count = [], [0]
 
         def at(r, i):
@@ -3870,12 +3899,7 @@ class Bot:
             self._rotate_pause_until = time.time() + 1800
             self.log("Every account's builders/lab are busy - farming here, checking again in 30 min.", "ok")
             return False
-        self.open_settings()
-        sw = self.wait_for("switch_account_button", 5)
-        if not sw:  # not on the village when asked (a results screen, a popup...): once more from the village
-            self.back_to_village()
-            self.open_settings()
-            sw = self.wait_for("switch_account_button", 5)
+        sw = self.switch_button()
         tag = settings_tag(self.shot()) if sw else None
         sc_of = self.cfg.setdefault("sc_of_tag", {})
         if tag and getattr(self, "_cur_sc", None):
@@ -3901,7 +3925,9 @@ class Bot:
             rows = [r for r in rows if r["sc"].lower() in wanted]
         picked = self.cfg.get("rotation_accounts")  # the dashboard / phone 'Accounts in rotation' picker
         if picked is not None and not target:
-            rows = [r for r in rows if r["sc"] in picked]
+            on = {re.sub(r"\W", "", a.lower()) for a in picked}
+            rows = [r for r in rows if re.sub(r"\W", "", r["sc"].lower()) in on]
+        self._rot_labels = {r["sc"] for r in rows}
         self._n_accounts = len(rows)
         if len(rows) < 2 and not target:
             return self.switch_fail(f"need 2+ accounts to rotate, found {[r['sc'] for r in rows]}")
@@ -3924,6 +3950,8 @@ class Bot:
             same = [i for i, r in enumerate(rows) if self.same_game_name(r["game"], bare)]
             if cur is None and len(same) == 1:  # only one account on the list has this in-game name: it's this one
                 cur = same[0]
+        if cur is None and not target:  # leaving an account that isn't in the rotation: not one of its busy ones
+            self._switch_streak = -1
         self._acc_idx = ((cur if cur is not None and not target else self._acc_idx) + 1) % len(rows)
         for _ in range(len(rows)):  # Fill & Switch: skip accounts already found full
             if not full_rotation or rows[self._acc_idx]["sc"] not in getattr(self, "_full_done", set()):
@@ -5889,11 +5917,13 @@ class App(tk.Tk):
         """(saved accounts, the ones in the rotation)."""
         accs = [a["sc"] for a in self.cfg.get("sc_accounts") or []]
         picked = self.cfg.get("rotation_accounts")
-        return accs, [a for a in accs if picked is None or a in picked]
+        nm = lambda x: re.sub(r"\W", "", x.lower())
+        return accs, [a for a in accs if picked is None or nm(a) in {nm(p) for p in picked}]
 
     def set_rotation(self, picked, by=""):
         accs, _ = self.rotation()
-        picked = [a for a in accs if a in picked]
+        nm = lambda x: re.sub(r"\W", "", x.lower())
+        picked = [a for a in accs if nm(a) in {nm(p) for p in picked}]
         self.cfg["rotation_accounts"] = None if len(picked) == len(accs) else picked  # None: everyone, new ones too
         save_config(self.cfg)  # the running bot shares this dict: the next switch uses it
         self.log(f"{by}Accounts in the rotation: " + (", ".join(picked) if picked else "none") + ".", "ok")
@@ -7108,6 +7138,15 @@ def selftest():
     assert not name_match("Ricochet Cannon", "Cannon") and not name_match("Dark Elixir Storage", "Elixir Storage")
     assert not name_match("Hog Rider", "Hog Glider") and not name_match("Miner", "Mine")
     assert all(map(is_wall, ("Wall", "Wall x28", "': Wall x2", "Wall xI50"))) and not is_wall("Wall Wrecker")
+    # Fill & Switch: full only after 2 real attacks where every storage barely rose
+    fb = type("F", (), {"log": lambda *a: None})()
+    hit = lambda gain, dmg=60, offer=(400_000, 400_000), dark=5000: (
+        setattr(fb, "_offered", offer), setattr(fb, "_dmg", dmg), Bot.note_full(fb, "A", gain, (1, 1, dark)),
+        Bot.storages_full(fb, "A"))[-1]
+    assert not hit([0, 0, 0], dmg=0) and not hit([0, 0, 0], offer=None) and not hit([300_000, 0, 0])
+    assert not hit([0, 0, 0]) and not hit([0, 0, 900], offer=(20_000, 400_000))  # 1 attack / dark rose
+    assert not hit([0, 0, 0]) and hit([5_000, 0, 0])  # dark's 2nd attack; +5k of 400k gold = under 5%
+    assert not hit([300_000, 0, 0])  # rose again: not full
     if wiki_data():  # price -> level, with the discount worked out from the whole list (Hammer Jam / Gold Pass)
         rows = [("Cannon x4", 3000000), ("Mortar x3", 21000000), ("Archer Queen", 380000), ("Laboratoru", 13000000)]
         for f in (1, 0.8, 0.5):
