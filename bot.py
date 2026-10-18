@@ -15,7 +15,6 @@ Unrecognised screen for a while -> press Back -> relaunch the game ->
 
 Run:           python bot.py
 Self-check:    python bot.py --selftest
-Old version:   bot_old.py (untouched backup)
 """
 import importlib.util
 import subprocess
@@ -75,7 +74,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 78  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 79  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1746,6 +1745,13 @@ class Bot:
                 self.list_req = False
                 self.read_accounts()
                 return True
+            if getattr(self, "scan_req", False):
+                self.scan_req = False
+                try:
+                    self.log(f"Upgrade planner: {self.scan_now()[0]} scanned.", "ok")
+                except RuntimeError as e:
+                    self.log(f"Upgrade scan failed: {e}", "warn")
+                return True
             return False
         self.list_req = False  # the switch reads the list anyway
         self.log(f"Phone: switching to {sc}.", "ok")
@@ -2932,7 +2938,7 @@ class Bot:
             return  # look again: there may be enough for more
         for _ in range(5):
             self.bb_bonus(name)
-            if not self.find(self.shot(), "bb_attack_button") and not self.wait_for("bb_attack_button", 20):
+            if not self.bb_home(20):
                 return
             self.bb_attack()
         self._bank_backoff.pop("bb_gold", None)  # new loot: try again
@@ -2956,7 +2962,7 @@ class Bot:
         if self.mode == "bb_loot":  # loot only: a plain loop on this account - attack, attack, attack; claim the
             for _ in range(10):     # Elixir Cart every 10 attacks. No Star Bonus counting, upgrades or switching.
                 self.bb_bonus(name)  # a Star Bonus popup can still show up: collect it and carry on
-                if not self.find(self.shot(), "bb_attack_button") and not self.wait_for("bb_attack_button", 20):
+                if not self.bb_home(20):
                     return  # not back on the village: the main loop sorts the screen out
                 self.bb_attack()
             return  # next round: collect (the cart) + boost, then 10 more
@@ -2969,7 +2975,7 @@ class Bot:
         # farm in short rounds, checking the upgrades after each: buys the plan's next target the moment it's
         # affordable (or anything, with no plan)
         for _ in range(5):
-            if not self.find(self.shot(), "bb_attack_button") and not self.wait_for("bb_attack_button", 20):
+            if not self.bb_home(20):
                 return  # not back on the village: the main loop sorts the screen out
             self.bb_attack()
         self.bb_collect()  # the Elixir Cart (and collectors)
@@ -3132,7 +3138,8 @@ class Bot:
             match = again or match
         self.tap(match[0][3], 1.6)
         if self.find(self.shot(), "guardians_title"):
-            f, k = self.shot(), self.shot().shape[1] / 1920
+            f = self.shot()
+            k = f.shape[1] / 1920
             btn = next(((int(cx * k), int(823 * k)) for cx in (432, 960, 1490)
                         if white_number(f, (int((cx - 130) * k), int(818 * k), int((cx + 95) * k), int(862 * k))) == price),
                        None)
@@ -4242,7 +4249,7 @@ class Bot:
 
 
 # ---------------------------------------------------------------------------
-# Phone view: read-only web page (live screen + stats), shared through the Anywhere link
+# Phone view: web page (live screen, stats, controls, settings), shared through the Anywhere link
 # ---------------------------------------------------------------------------
 PHONE_PAGE = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#121418"><title>Loot Farmer</title><style>
@@ -4280,6 +4287,13 @@ h2{font-size:12px;color:#9a9a9a;text-transform:uppercase;letter-spacing:.05em;ma
 #rotl label{display:flex;align-items:center;gap:6px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #rotl input{width:18px;height:18px;accent-color:#f5c542;flex:none}
 .ctl #cmsg{flex-basis:100%;color:#9a9a9a;font-size:12px}
+.set summary{cursor:pointer;font-weight:600}.set h3{font-size:11px;color:#9a9a9a;text-transform:uppercase;
+letter-spacing:.05em;margin:12px 0 4px}.set label{display:flex;align-items:center;justify-content:space-between;gap:10px;
+padding:6px 0;font-size:14px;border-bottom:1px solid #262a33}.set input[type=checkbox]{width:20px;height:20px;
+accent-color:#f5c542;flex:none}.set input[type=number],.set select{font:inherit;font-size:14px;border:0;border-radius:8px;
+padding:6px 8px;background:#2a2f3a;color:#e9e9ec;width:130px;flex:none}
+.tools{display:flex;gap:8px;margin-top:10px}.tools button{flex:1;font:inherit;font-size:14px;border:0;border-radius:10px;
+padding:10px 12px;background:#2a2f3a;color:#e9e9ec}
 #log{background:#141414;border-radius:12px;padding:10px;font:12px ui-monospace,Consolas,monospace;white-space:pre-wrap;
 max-height:260px;overflow:auto}
 @media(max-width:420px){.r4{grid-template-columns:repeat(2,1fr)}}
@@ -4295,6 +4309,9 @@ max-height:260px;overflow:auto}
 <option value="60">1 hour</option><option value="120">2 hours</option></select><button id="rg">Restart game</button>
 <input id="accq" type="search" placeholder="Search accounts" autocomplete="off"><select id="acc"></select><button id="sw">Switch account</button><button id="rs" title="Read the account list again (new accounts)">&#8635; Rescan accounts</button>
 <div id="cmsg"></div></div>
+<details class="card set" id="set"><summary>Settings</summary><div id="setl"></div>
+<div class="tools"><button id="scan">&#128269; Scan upgrades</button><button id="rep">&#128030; Send debug report</button></div>
+</details>
 <div class="row r3" id="rates"></div>
 <div class="row r2" id="store"></div>
 <div class="row r4" id="g"></div>
@@ -4325,11 +4342,23 @@ if(confirm("Switch to "+a+"?"))cmd({action:"switch_account",account:a});};
 const STATS=[["runtime","Runtime"],["attacks","Attacks","king"],["walls","Walls","wall"],["upgrades","Upgrades","hammer"],
 ["switches","Switches","builder_icon"],["skipped","Skipped","shield"],["errors","Errors"],["battery","Battery"]];
 for(const k of ["rotate_accounts","builder_base_enabled"])$("o_"+k).onchange=e=>cmd({action:"set_option",key:k,value:e.target.checked});
+$("scan").onclick=()=>confirm("Scan this account's upgrades in the game now?")&&cmd({action:"scan_upgrades"});
+$("rep").onclick=()=>confirm("Send a debug report (log + screenshots) to Discord?")&&cmd({action:"send_report"});
+function fillSet(S){const L=$("setl"),K=JSON.stringify(S.map(([g,fs])=>[g,fs.map(f=>[f[0],f[1],f[2],f[4]])]));
+if(L.dataset.k!==K){L.dataset.k=K;L.innerHTML=S.map(([g,fs])=>`<h3>${esc(g)}</h3>`+fs.map(([k,l,t,v,ch])=>
+`<label>${esc(l)}`+(t=="bool"?`<input type="checkbox" data-k="${k}">`:t=="choice"?`<select data-k="${k}">`+
+ch.map(c=>`<option>${esc(c)}</option>`).join("")+"</select>":`<input type="number" min="0" step="any" inputmode="decimal" data-k="${k}">`)
++"</label>").join("")).join("");
+L.querySelectorAll("[data-k]").forEach(i=>i.onchange=()=>{let v=i.type=="checkbox"?i.checked:i.tagName=="SELECT"?i.value:Number(i.value);
+if(i.type=="number"&&(i.value===""||!(v>=0)))return tick();cmd({action:"set_option",key:i.dataset.k,value:v});});}
+for(const[,fs]of S)for(const[k,,t,v]of fs){const i=L.querySelector(`[data-k="${k}"]`);if(!i||document.activeElement===i)continue;
+if(t=="bool")i.checked=!!v;else if(String(i.value)!==String(v))i.value=v;}}
 async function tick(){try{const s=await (await fetch("status"+Q,{cache:"no-store"})).json();
 const st=$("state");st.textContent=s.state;st.className="pill"+(/idle|stopped/i.test(s.state)?" idle":/recover/i.test(s.state)?" off":"");
 $("mode").textContent=s.mode?"Mode: "+s.mode:"";
 if(s.modes&&!$("m").options.length)$("m").innerHTML=s.modes.map(([v,ms])=>`<optgroup label="${v}">`+
 ms.map(([k,l])=>`<option value="${k}">${l}</option>`).join("")+"</optgroup>").join("");
+fillSet(s.settings||[]);
 const O=s.options||{};for(const k in O)if(document.activeElement!==$("o_"+k))$("o_"+k).checked=O[k];
 const RA=s.accounts||[],RT=s.rotation||[],RK=JSON.stringify([RA,RT]);if($("rotl").dataset.k!==RK&&!$("rotl").contains(document.activeElement)){
 $("rotl").dataset.k=RK;$("rots").textContent="Accounts in rotation: "+RT.length+" of "+RA.length;
@@ -4360,8 +4389,30 @@ tick();setInterval(tick,1500);</script></body></html>"""
 
 
 PHONE_ACTIONS = ("start", "stop", "pause", "restart_game", "switch_account", "load_accounts", "set_option",
-                 "set_rotation")
-PHONE_OPTIONS = ("rotate_accounts", "builder_base_enabled")  # the only settings the phone can change
+                 "set_rotation", "send_report", "scan_upgrades")
+PHONE_OPTIONS = ("rotate_accounts", "builder_base_enabled")  # Farm & Upgrade's two switches, by the mode picker
+# what the phone's Settings can change: gameplay only - never paths, keys, ports or anything that starts a program
+PHONE_SETTINGS = ("loot_force_attack", "loot_require_both", "loot_gold_threshold", "loot_elixir_threshold",
+                  "deploy_spells", "deploy_speed", "hero_abilities", "surrender_damage_threshold", "battle_max_wait",
+                  "builder_upgrades_enabled", "skip_town_hall", "lab_upgrades_enabled", "pets_upgrades_enabled",
+                  "bank_spend_enabled", "bank_spend_threshold", "builder_base_enabled", "bb_attacks_enabled",
+                  "bb_builder_upgrades", "bb_lab_upgrades", "bb_visit_hours", "rotate_accounts", "stop_when_all_busy")
+SETTING_KIND = {k: (label, kind) for _, _, fs in SETTINGS for k, label, kind in fs}
+
+
+def phone_value(key, v):
+    """A setting sent from the phone, checked against its type (a yes/no, one of a list, a number 0..1e9) - or
+    None when it isn't one the phone may set."""
+    if key not in PHONE_SETTINGS:
+        return None
+    kind = SETTING_KIND[key][1]
+    if kind is bool:
+        return v if isinstance(v, bool) else None
+    if isinstance(kind, tuple):
+        return v if v in kind else None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1e9:
+        return None
+    return int(v) if kind is int else float(v)
 
 
 class PhoneView:
@@ -4381,8 +4432,8 @@ class PhoneView:
                     return
                 try:
                     cmd = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 2000)))
-                    ok = isinstance(cmd, dict) and cmd.get("action") in PHONE_ACTIONS and (cmd["action"] != "set_option" or (
-                        cmd.get("key") in PHONE_OPTIONS and isinstance(cmd.get("value"), bool)))
+                    ok = isinstance(cmd, dict) and cmd.get("action") in PHONE_ACTIONS and (
+                        cmd["action"] != "set_option" or phone_value(cmd.get("key"), cmd.get("value")) is not None)
                 except (ValueError, TypeError):
                     ok = False
                 if ok:
@@ -5767,7 +5818,6 @@ class App(tk.Tk):
         return t
 
     # --- layout ---
-    # --- layout ---
     def ui_icon(self, name, size):
         """A Clash icon from wiki/ui/ (from the wiki) at that height, cached; None if missing."""
         cache = self.__dict__.setdefault("_ui_icons", {})
@@ -6289,7 +6339,8 @@ class App(tk.Tk):
         if self.started_at and time.time() - getattr(self, "_loot_t", 0) > 5:  # keep the /hr rates current
             self._loot_t = time.time()
             self.render_loot()
-        if self.phone:
+        if self.phone and time.time() - getattr(self, "_st_t", 0) >= 1:
+            self._st_t = time.time()
             st = {k: lbl.cget("text") for k, lbl in {**self.stat_labels, **self.res_labels}.items()}
             st["battery"] = self.batt_label.cget("text").replace("🔋 ", "") or "-"
             st["loot"] = getattr(self, "loot_view", [])
@@ -6299,6 +6350,10 @@ class App(tk.Tk):
             st["mode_key"] = self.bot.mode if self.bot else self.mode_var.get()
             st["modes"] = [[v, [[k, MODES[k][0]] for k in ms]] for v, ms in VILLAGES]
             st["options"] = {k: bool(self.cfg[k]) for k in PHONE_OPTIONS}
+            st["settings"] = [[g, [[k, label, "bool" if kind is bool else "choice" if isinstance(kind, tuple) else
+                                    "num", self.cfg[k], list(kind) if isinstance(kind, tuple) else None]
+                                   for k, label, kind in fs if k in PHONE_SETTINGS]] for g, _, fs in SETTINGS
+                              if any(k in PHONE_SETTINGS for k, _, _ in fs)]
             st["rotation"] = self.rotation()[1]
             st["resume_in"] = max(0, int(self._resume[0] - time.time())) if self._resume else 0
             st["accounts"] = [[a["sc"], (f"{a['game']} · {a['sc']}" if a.get("game") and a["game"] not in a["sc"]
@@ -6525,16 +6580,34 @@ class App(tk.Tk):
                 return self.log("📱 Phone: rotation - that list isn't valid.", "warn")
             self.set_rotation(picked, "📱 Phone: ")
         elif a == "set_option":
-            key = c.get("key")
-            if key not in PHONE_OPTIONS or not isinstance(c.get("value"), bool):
+            key, val = c.get("key"), phone_value(c.get("key"), c.get("value"))
+            if val is None:
                 return self.log("📱 Phone: that setting can't be changed from the phone.", "warn")
-            self.opt_vars[key].set(c["value"])
-            self.cfg[key] = c["value"]  # the running bot shares this dict: takes effect at once
+            self.cfg[key] = val  # the running bot shares this dict: takes effect at once
+            if key in self.opt_vars:
+                self.opt_vars[key].set(val)
             if key in getattr(self, "svars", {}):
-                self.svars[key][0].set(c["value"])
+                self.load_settings_vars([key])
             save_config(self.cfg)
-            self.log(f"📱 Phone: {'switch accounts' if key == 'rotate_accounts' else 'visit the Builder Base'} "
-                     f"{'on' if c['value'] else 'off'}.", "ok")
+            self.log(f"📱 Phone: {SETTING_KIND[key][0]} - " + ("on" if val is True else "off" if val is False else
+                                                              f"{val:,}" if isinstance(val, int) else str(val)) + ".",
+                     "ok")
+        elif a == "send_report":
+            if time.time() - getattr(self, "_phone_report_t", 0) < 60:
+                return self.log("📱 Phone: a debug report was just sent - wait a minute.", "warn")
+            self._phone_report_t = time.time()
+            self.log("📱 Phone: sending a debug report to Discord.", "ok")
+            self.send_report("sent from the phone")
+        elif a == "scan_upgrades":
+            self.log("📱 Phone: scan this account's upgrades" + (" (at the next village screen)." if running else "."),
+                     "ok")
+            if running:
+                self.bot.scan_req = True
+            else:
+                def scan():
+                    acc, _ = Bot(self.cfg, self.adb, self.emit).scan_now()
+                    self.log(f"Upgrade planner: {acc} scanned.", "ok")
+                self.bg(scan)
         elif a == "restart_game":
             if running:
                 self.log("📱 Phone: restart the game.", "ok")
@@ -6809,7 +6882,7 @@ class App(tk.Tk):
         self._close()
         exe = sys.executable
         if os.name == "nt" and exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe"):
-            exe = exe[:-10] + "pythonw.exe"
+            exe = exe[:-10] + "pythonw.exe"  # no console window
         subprocess.Popen([exe, os.path.abspath(__file__)], cwd=BASE_DIR, creationflags=0x00000008)
 
     def send_report(self, reason, auto=False):
@@ -6861,11 +6934,7 @@ class App(tk.Tk):
         if self.thread and not messagebox.askyesno("Restart", "Farming is running - stop it and restart the app?"):
             return
         self.log("Restarting…")
-        self._close()
-        exe = sys.executable
-        if os.name == "nt" and exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe"):
-            exe = exe[:-10] + "pythonw.exe"  # no console window
-        subprocess.Popen([exe, os.path.abspath(__file__)], cwd=BASE_DIR, creationflags=0x00000008)  # detached
+        self._restart_now()
 
     def _close(self):
         if self.bot:
@@ -7147,6 +7216,12 @@ def selftest():
     assert not hit([0, 0, 0]) and not hit([0, 0, 900], offer=(20_000, 400_000))  # 1 attack / dark rose
     assert not hit([0, 0, 0]) and hit([5_000, 0, 0])  # dark's 2nd attack; +5k of 400k gold = under 5%
     assert not hit([300_000, 0, 0])  # rose again: not full
+    # the phone may only set gameplay settings, each with a value of its type
+    assert phone_value("hero_abilities", False) is False and phone_value("loot_gold_threshold", 900000.0) == 900000
+    assert phone_value("deploy_speed", "Slow") == "Slow" and phone_value("surrender_damage_threshold", 60) == 60.0
+    assert all(phone_value(k, v) is None for k, v in (("emulator_exe_path", "x"), ("adb_path", "x"), ("nope", 1),
+               ("hero_abilities", 1), ("loot_gold_threshold", True), ("loot_gold_threshold", -5),
+               ("loot_gold_threshold", "5"), ("deploy_speed", "Warp")))
     if wiki_data():  # price -> level, with the discount worked out from the whole list (Hammer Jam / Gold Pass)
         rows = [("Cannon x4", 3000000), ("Mortar x3", 21000000), ("Archer Queen", 380000), ("Laboratoru", 13000000)]
         for f in (1, 0.8, 0.5):
