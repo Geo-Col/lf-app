@@ -76,7 +76,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 76  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 77  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1680,10 +1680,16 @@ class Bot:
 
     def open_settings(self, delay=2.0):
         """Settings now lives in the profile window: the player card (top-left) -> its Settings tab."""
+        for _ in range(3):  # popups (Hero Journey, chests) can sit over the village and eat the tap
+            f = self.shot()
+            if self.at_village(f) or not (self.hero_journey(f) or self.event_chest(f) or self.close_popup(f)):
+                break
         k = self.shot().shape[1] / 1920
         self.tap((int(90 * k), int(120 * k)), 1.8)
         self.tutorial(self.shot())  # first time: 'Settings has moved to the Profile Menu'
         self.tap((int(1518 * k), int(90 * k)), delay)
+        if not self.find(self.shot(), "switch_account_button"):  # the profile window was slow: its tab once more
+            self.tap((int(1518 * k), int(90 * k)), delay)
 
     def tutorial(self, frame):
         """The game's one-off tutorials after the redesign (the Builder Menu, 'Settings has moved'...): the guide
@@ -3851,7 +3857,7 @@ class Bot:
             self.log(f"Two accounts are called '{name}': this one's planner data is now under '{key}'.", "ok")
         return key
 
-    def switch_account(self, target=None, full_rotation=False):
+    def switch_account(self, target=None, full_rotation=False, _try=0):
         """Settings cog -> blue switch button -> tap the next account on the Supercell ID list (or `target`, a
         Supercell ID name - picked on the phone view)."""
         # _switch_streak = accounts already left because they were busy; this one is busy too
@@ -3946,6 +3952,27 @@ class Bot:
                     if self.account_name(self.shot()) != "?":
                         break
                     self.sleep(1.0)
+                # did it land on the account that was tapped? Its in-game name (top-left) must be the card's
+                # in-game name ('SPANNER1610' plays as 'Skopos'). A couple of reads: the name can still be animating
+                game = re.sub(r"\s+", "", row.get("game") or "")
+                read = self._last_name
+                for _ in range(2):
+                    if not read or len(game) < 3 or self.same_game_name(read.split(" (")[0], game):
+                        break
+                    self.sleep(1.5)
+                    self._last_name = None
+                    read = self.account_name(self.shot())
+                    read = None if read == "?" else read
+                if read and len(game) >= 3 and not self.same_game_name(read.split(" (")[0], game):
+                    if _try < 2:
+                        self.log(f"Account switch: wanted {name} (in-game '{row.get('game')}') but this is "
+                                 f"'{read}' - switching again.", "warn")
+                        return self.switch_account(target=name, _try=_try + 1)
+                    self.log(f"Account switch: still on '{read}', not {name} ('{row.get('game')}') after 3 tries.",
+                             "err")
+                else:
+                    self.log(f"Switched to {name}" + (f" (in-game name: {row.get('game')})" if game else "") + " ✓",
+                             "ok")
                 self._last_name = self._last_name or name
                 self._sc_key = self.account_key(row, rows, self._last_name)  # two accounts with one in-game name
                 if self._sc_key:
@@ -5879,9 +5906,11 @@ class App(tk.Tk):
         m = self.rot_menu
         m.delete(0, "end")
         self.rot_vars = {}
+        games = {x["sc"]: x.get("game") for x in self.cfg.get("sc_accounts") or []}
         for a in accs:
             v = self.rot_vars[a] = tk.BooleanVar(value=a in on)
-            m.add_checkbutton(label=a, variable=v, command=lambda: self.set_rotation(
+            g = games.get(a)
+            m.add_checkbutton(label=f"{g}  ·  {a}" if g and g not in a else a, variable=v, command=lambda: self.set_rotation(
                 [x for x, vv in self.rot_vars.items() if vv.get()]))
         if accs:
             m.add_separator()
@@ -6242,7 +6271,8 @@ class App(tk.Tk):
             st["options"] = {k: bool(self.cfg[k]) for k in PHONE_OPTIONS}
             st["rotation"] = self.rotation()[1]
             st["resume_in"] = max(0, int(self._resume[0] - time.time())) if self._resume else 0
-            st["accounts"] = [[a["sc"], a["sc"] + (f" - {a['game']}" if a.get("game") and a["game"] not in a["sc"] else "")
+            st["accounts"] = [[a["sc"], (f"{a['game']} · {a['sc']}" if a.get("game") and a["game"] not in a["sc"]
+                                         else a["sc"])
                                + (f" (TH{a['th']})" if a.get("th") else "")] for a in self.cfg.get("sc_accounts") or []]
             st["current_acc"] = getattr(self.bot, "_cur_sc", None) if self.bot else None
             st["bb"] = self.bb_view
