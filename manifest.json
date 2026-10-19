@@ -1,7 +1,7 @@
 {
- "version": 79,
+ "version": 80,
  "files": {
-  "bot.py": "61176a2c3c9324c5bfca9eff26cfcbb951d409196ba067cc4a660d19366c92c4",
+  "bot.py": "a16852258e0222c6ce2bd7271366ebe61a2511e55535fdb2eebd9e554ff215c0",
   "setup.ps1": "3f4ed8e0b98b0fc30adf41469845bfef9c0f3fa68c5e7a0fc1d49e5a81cac766",
   "Setup.bat": "3d3ea502d691eccb7207f2d7388826a07c48f3f0c8eafa6c0a96df51b88bb8d3",
   "README.txt": "57d062e410301c98c6f86474af570802ccdbcc1a0723012e0e63ff2393dc6b08",
@@ -56,6 +56,7 @@
   "templates/return_home_button_alt.png": "3b7943dac6af9dc8d3c3084348a601bef1c78bf67d68c32248c06addfc7dcc2b",
   "templates/supercell_id_header.png": "dab1797a912a3df81e7ec80fb0530bb2fadae3cfaba5eaf9689e9ca805e2a939",
   "templates/surrender_button.png": "6ce3496696e71f900d3df5b53146977621b620c6fdd22b291a3dfe9eac6c9828",
+  "templates/surrender_button_alt.png": "4c1b41c3e065afa120709551b7aad9cfd481d925f28e986983dc5fdc74e53d75",
   "templates/surrender_confirm_button.png": "a661439b47f07ca43f83d7afccc4817b4f16bc591eace971cca8da5384e0c172",
   "templates/switch_account_button.png": "ee18db89c5972c891406eb194149fe432e1929e7b22732324eb476d273a5f291",
   "templates/tutorial_arrow_build.png": "074decb82d7fa9cf48235dc01fcd2e0ab3fd95a6114fa177d9a9344e5cae6602",

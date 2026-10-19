@@ -74,7 +74,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 79  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 80  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2636,12 +2636,15 @@ class Bot:
         # only bubbles in the open middle: one sitting over the edge buttons (Season Pass, Attack, Shop, the
         # resource bars...) would tap that button instead. It gets collected another time.
         safe = lambda p: 0.13 * W < p[0] < 0.87 * W and 0.11 * H < p[1] < 0.76 * H
+        cart = False
         for xy in filter(safe, self.matches(f, "bb_elixir_bubble", 0.7) + self.matches(f, "bb_gold_bubble", 0.7)
                          + self.matches(f, "bb_gem_bubble", 0.7)):
             self.tap(xy, 1.0)
             if self.find(self.shot(), "bb_cart_title"):  # that bubble was the cart's
                 self.cart_window()
-        self.bb_cart()
+                cart = True
+        if not cart and not self.bb_cart():
+            self.log("Builder Base: no Elixir Cart to collect (its bubble only shows with elixir in it).")
 
     def cart_window(self):
         """The Elixir Cart window is open: Collect if the button is green (grey = nothing in it), then close."""
@@ -2652,6 +2655,8 @@ class Bot:
             if ((hsv[:, :, 0] > 30) & (hsv[:, :, 0] < 90) & (hsv[:, :, 1] > 120)).mean() > 0.25:
                 self.tap(btn, 1.2)
                 self.log("Builder Base: collected the Elixir Cart.", "ok")
+            else:
+                self.log("Builder Base: the Elixir Cart has nothing to collect yet.")
         self.adb.back()
         self.sleep(1.0)
 
@@ -2672,7 +2677,7 @@ class Bot:
             for xy in [p for p in self.matches(f, "bb_elixir_bubble", 0.7) if 250 < p[0] < 1650 and 150 < p[1] < 820]:
                 self.tap(xy, 1.2)
                 if self.find(self.shot(), "bb_cart_title"):
-                    return self.cart_window()
+                    return self.cart_window() or True
             return
         if abs(boat[0] - 1150) > 120 or abs(boat[1] - 520) > 120:  # dock into the middle: the cart is beside it
             self.adb.swipe(960, 540, 960 + 1150 - boat[0], 540 + 520 - boat[1], 900)
@@ -2690,7 +2695,7 @@ class Bot:
         for xy in spots[:3]:
             self.tap(xy, 1.2)
             if self.find(self.shot(), "bb_cart_title"):
-                return self.cart_window()
+                return self.cart_window() or True
 
     def bb_bonus(self, name):
         """Collect the 'Star Bonus!' popup if it's showing. True if one was collected just now."""
@@ -2727,7 +2732,7 @@ class Bot:
         """(earned, needed) of today's star bonus from the Builder Base Attack button, or None."""
         return read_counter(f, BB_STARS)
 
-    def bb_attack(self):
+    def bb_attack(self, quick=False):
         """One Builder Base battle: Attack -> Find Now -> drop every card on the open ground at the left ->
         Battle Machine ability -> wait for Return Home. Builder Base bases can't be skipped; loot isn't read."""
         for _ in range(2):  # the first tap only deselects a building that's still selected
@@ -2736,7 +2741,14 @@ class Bot:
             if find:
                 break
         if not find:
+            if self.close_popup(self.shot()):  # the Start Attack window, but 'Attack available in 1m 22s' instead
+                if not getattr(self, "_bb_cooling", False):  # of Find Now: wait it out (said once, not every try)
+                    self._bb_cooling = True
+                    self.log("Builder Base: the next attack isn't available yet (game cooldown) - waiting.")
+                self.sleep(30)
+                return None
             return self.log("Builder Base: Find Now didn't show.", "warn")
+        self._bb_cooling = False
         self.tap(find, 1.0)
         cards, end = [], time.time() + 40
         while not cards and time.time() < end:  # matchmaking, then the battle screen with the troop bar
@@ -2745,8 +2757,13 @@ class Bot:
         if not cards:
             return self.log("Builder Base: no battle screen after Find Now.", "warn")
         self.bump("attacks")
-        self.bb_deploy(cards)
-        self.log(f"Builder Base: attacking with {len(cards)} cards.", "ok")
+        if quick:  # Elixir Farm: one troop down, surrender at once
+            one = next((c for c in cards if c[2] != "hero"), cards[0])
+            self.bb_deploy([(one[0], one[1], one[2], 1)])
+            self.bb_surrender()
+        else:
+            self.bb_deploy(cards)
+            self.log(f"Builder Base: attacking with {len(cards)} cards.", "ok")
         end = time.time() + 420  # up to two stages of 3 min each
         while time.time() < end:  # the battle ends by itself once every troop is down (or the timer runs out)
             self.sleep(6)
@@ -2777,6 +2794,21 @@ class Bot:
                 return hit
             if not (self.close_popup(f) or self.event_chest(f) or self.hero_journey(f)):
                 self.sleep(0.8)
+
+    def bb_surrender(self):
+        """Elixir Farm: straight after the one troop - Surrender (End Battle once a star is in), then its Okay."""
+        ok = None
+        for _ in range(3):  # a tap can land while the troop is still being placed: tap again
+            f = self.shot()
+            k = f.shape[1] / 1920
+            self.tap(self.find(f, "surrender_button") or (int(137 * k), int(750 * k)), 1.0)
+            ok = self.wait_for("surrender_confirm_button", 3)
+            if ok:
+                break
+        if not ok:
+            return self.log("Builder Base: the Surrender dialog didn't show - finishing the battle normally.", "warn")
+        self.tap(ok, 2.0)
+        self.log("Builder Base: 1 troop placed, surrendered.", "ok")
 
     def bb_deploy(self, cards):
         a, b = (390, 380), (260, 600)  # left edge of the map: always outside the base, clear of the Boost buttons
@@ -2959,12 +2991,15 @@ class Bot:
         self.bb_clock_boost()
         if self.mode == "bb_walls":
             return self.bb_walls(name)
-        if self.mode == "bb_loot":  # loot only: a plain loop on this account - attack, attack, attack; claim the
-            for _ in range(10):     # Elixir Cart every 10 attacks. No Star Bonus counting, upgrades or switching.
+        if self.mode in ("bb_loot", "bb_elixir"):  # a plain loop on this account - attack, attack, attack; claim
+            n = self.stats["attacks"]  # the Elixir Cart every 10 attacks. No Star Bonus counting, upgrades or
+            for _ in range(30):  # switching. (Tries that hit the game's attack cooldown don't count.)
+                if self.stats["attacks"] - n >= 10:
+                    break
                 self.bb_bonus(name)  # a Star Bonus popup can still show up: collect it and carry on
                 if not self.bb_home(20):
                     return  # not back on the village: the main loop sorts the screen out
-                self.bb_attack()
+                self.bb_attack(quick=self.mode == "bb_elixir")  # Elixir Farm: troops down, raid ended early
             return  # next round: collect (the cart) + boost, then 10 more
         self.bb_session(name, upgrades=True)
         if not self.bb_done_today(name):
@@ -4986,8 +5021,10 @@ MODES = {"farm": ("Farm & Upgrade", "Attacks and keeps every builder, the lab an
          "bb_farm": ("Farm & Upgrade", "Builder Base attacks + upgrades (Star Lab, Clock Tower boost, cart).",
                      "builderhall"),
          "bb_loot": ("Attack Only", "Builder Base attacks only - daily stars and loot.", "bgold"),
+         "bb_elixir": ("Elixir Farm", "Builder Base: places 1 troop and surrenders straight away, claims the "
+                                      "Elixir Cart every 10 attacks.", "belixir"),
          "bb_walls": ("Walls", "Builder Base walls: farms and buys them.", "wall")}
-VILLAGES = (("Home Village", ("farm", "loot", "loot_rotate", "walls")), ("Builder Base", ("bb_farm", "bb_loot", "bb_walls")))
+VILLAGES = (("Home Village", ("farm", "loot", "loot_rotate", "walls")), ("Builder Base", ("bb_farm", "bb_loot", "bb_elixir", "bb_walls")))
 mode_name = lambda m: f"{MODES[m][0]} · {'Builder Base' if m.startswith('bb_') else 'Home Village'}"
 GREEN, AMBER, RED, BLUE, GOLD, PINK = "#3ddc97", "#f2b84b", "#ff6b6b", "#5aa9ff", "#f5b942", "#e07bff"
 
