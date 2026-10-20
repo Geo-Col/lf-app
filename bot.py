@@ -74,7 +74,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 80  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 81  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1323,6 +1323,18 @@ def list_rows(frame):
     return out
 
 
+def card_deployed(frame, x):
+    """A hero / siege machine / Clan Castle card whose unit is on the field: its health bar sits just above the
+    card - bright green, as wide as the health left. Measured: 0.5-1.0 of the width on the field (a
+    hurt Grand Warden 0.53), exactly 0 before it's placed (grass behind the bar never reaches this strip)."""
+    H, W = frame.shape[:2]
+    k = W / 1920
+    band = cv2.cvtColor(frame[int(H * 0.785):int(H * 0.82), max(0, x - int(45 * k)):x + int(45 * k)],
+                        cv2.COLOR_BGR2HSV)
+    m = (band[:, :, 0] >= 40) & (band[:, :, 0] <= 80) & (band[:, :, 1] > 150) & (band[:, :, 2] > 170)
+    return m.size > 0 and float(m.mean(axis=1).max()) >= 0.15
+
+
 def icon_empty(frame, x, y, half=14):
     """A used-up troop slot turns grey: low saturation at its centre."""
     p = frame[max(0, y - half):y + half, max(0, x - half):x + half]
@@ -1687,17 +1699,25 @@ class Bot:
         if not self.find(self.shot(), "switch_account_button"):  # the profile window was slow: its tab once more
             self.tap((int(1518 * k), int(90 * k)), delay)
 
-    def switch_button(self):
-        """Profile -> Settings -> the blue switch-account button (where it is), or None. Not on the village when
-        asked (a results screen, a popup...): once more from the village."""
-        for i in range(2):
+    def open_account_list(self):
+        """Profile -> Settings -> the blue switch-account button -> the Supercell ID list. Up to 3 tries from the
+        village: just after an account has loaded, a late popup or a slow window can eat a tap. Returns (opened,
+        the player tag read in Settings on the way); a failure leaves its screen in debug_switch.png."""
+        tag = None
+        for i in range(3):
             if i:
                 self.back_to_village()
+                self.sleep(1.5)
             self.open_settings()
             sw = self.wait_for("switch_account_button", 5)
-            if sw:
-                return sw
-        return None
+            if not sw:
+                continue
+            tag = settings_tag(self.shot()) or tag
+            self.tap(sw, 2.5)
+            if self.wait_for("supercell_id_header", 6):
+                return True, tag
+        cv2.imwrite(os.path.join(BASE_DIR, "debug_switch.png"), self.shot())
+        return False, tag
 
     def tutorial(self, frame):
         """The game's one-off tutorials after the redesign (the Builder Menu, 'Settings has moved'...): the guide
@@ -1723,12 +1743,11 @@ class Bot:
     def read_accounts(self):
         """Open the Supercell ID list just to note the accounts on it (for the phone view's picker), then close it."""
         self.back_to_village()
-        sw = self.switch_button()
-        if sw:
-            self.tap(sw, 2.5)
-            if self.wait_for("supercell_id_header", 6):
-                rows = self.all_accounts()
-                self.log(f"Accounts on this device: {', '.join(r['sc'] for r in rows)}.", "ok")
+        if self.open_account_list()[0]:
+            rows = self.all_accounts()
+            self.log(f"Accounts on this device: {', '.join(r['sc'] for r in rows)}.", "ok")
+        else:
+            self.log("Couldn't open the Supercell ID list (screen: debug_switch.png).", "warn")
         self.back_to_village()
         if not self.at_village(self.shot()):  # the Supercell ID panel can need a couple of Backs
             for _ in range(3):
@@ -3941,8 +3960,7 @@ class Bot:
             self._rotate_pause_until = time.time() + 1800
             self.log("Every account's builders/lab are busy - farming here, checking again in 30 min.", "ok")
             return False
-        sw = self.switch_button()
-        tag = settings_tag(self.shot()) if sw else None
+        opened, tag = self.open_account_list()
         sc_of = self.cfg.setdefault("sc_of_tag", {})
         if tag and getattr(self, "_cur_sc", None):
             if sc_of.get(tag) != self._cur_sc:
@@ -3950,11 +3968,8 @@ class Bot:
                 save_config(self.cfg)
         elif tag:
             self._cur_sc = next((sc for t, sc in sc_of.items() if same_tag(t, tag)), None)
-        if not sw:
-            return self.switch_fail("switch-account button not found")
-        self.tap(sw, 2.5)
-        if not self.wait_for("supercell_id_header", 6):
-            return self.switch_fail("Supercell ID list didn't open")
+        if not opened:
+            return self.switch_fail("couldn't open the Supercell ID list after 3 tries (screen: debug_switch.png)")
         rows = self.all_accounts()
         if target:
             nm = lambda x: re.sub(r"\W", "", (x or "").lower())  # a re-read can change 'S' to 's'
@@ -4083,10 +4098,17 @@ class Bot:
         """(pause between taps, pause after picking a card) for the chosen placing speed."""
         return DEPLOY_SPEEDS.get(self.cfg.get("deploy_speed"), DEPLOY_SPEEDS["Fastest"])
 
-    def drop(self, a, b, n, card):
+    def drop(self, a, b, n, card, retry=False):
         """Deploy n of the selected unit as taps spread evenly along a->b. Never drags: a moving touch scrolls the
-        view instead of placing troops. With a single spot (a == b) and hold-to-deploy, a still long-press is used."""
+        view instead of placing troops. With a single spot (a == b) and hold-to-deploy, a still long-press is used.
+        retry: units the first go missed - slower taps, between the first go's spots (one may not allow troops)."""
         c = self.cfg
+        if retry:
+            pts = [self.along(a, b, k + 0.5, n + 1) for k in range(n)]
+            for i in range(0, n, 20):
+                self.adb.shell("; sleep 0.1; ".join(f"input tap {x} {y}" for x, y in pts[i:i + 20]),
+                               timeout=10 + 2 * len(pts[i:i + 20]))
+            return
         if a == b and c["hold_deploy"] and n >= 3 and card:
             ms = min(n * c["hold_ms_per_troop"], 8000)
             for _ in range(3):
@@ -4129,9 +4151,41 @@ class Bot:
                 self.tap((x, y), delay)
                 self.adb.tap(*self.along(a, b, k, len(singles)))
             self.sleep(0.1)
+        # the bar again: anything still on it goes down - taps the game dropped, a spot on the line it doesn't
+        # allow, or cards that didn't fit on the screen (a big army's bar scrolls: dragged along to show the rest)
+        scrolled, tapped = False, []
+        for _ in range(4):
+            self.sleep(0.8)
+            f = self.shot()
+            bar = troop_bar(f)
+            left = [cd for cd in bar if cd[3] and (cd[2] == "troop" or cd[2] == "spell" and self.cfg["deploy_spells"])]
+            idle = [cd for cd in bar if cd[2] in ("hero", "single") and not card_deployed(f, cd[0])
+                    and all(abs(cd[0] - t) > 20 for t in tapped)]  # once each (a Builder Base card has no bar)
+            if left or idle:
+                self.log("Still on the bar after deploying: " + ", ".join(
+                    [f"{cd[2]} x{cd[3]}" for cd in left] + [cd[2] for cd in idle]) + " - placing them now.", "warn")
+            for x, y, kind, n in left:
+                self.tap((x, y), max(delay, 0.2))
+                self.drop(*((sa, sb) if kind == "spell" else (a, b)), n, (x, y), retry=True)
+            for x, y, kind, _ in idle:
+                tapped.append(x)
+                self.tap((x, y), max(delay, 0.2))
+                self.adb.tap(*self.along(a, b, 1, 2))
+                self.sleep(0.2)
+            full = bar and "empty" not in [cd[2] for cd in bar] and max(cd[0] for cd in bar) > f.shape[1] * 0.85
+            if not left and not idle:
+                if scrolled or not full:
+                    break
+                k = f.shape[1] / 1920  # every slot filled up to the edge: the bar scrolls - show its other end
+                self.adb.swipe(int(1750 * k), int(975 * k), int(250 * k), int(975 * k), 600)
+                scrolled = True
+        if scrolled:  # the hero cards moved with the bar: their abilities are tapped where they are now
+            f = self.shot()
+            self._ability_cards = [(x, y) for x, y, kind, _ in troop_bar(f) if kind == "hero" and card_deployed(f, x)]
         # tapping a deployed hero's card = its ability. Never the Clan Castle's: a siege machine's card would
         # break it open early
-        self._ability_cards = [(x, y) for x, y, kind, _ in singles if kind == "hero"]
+        if not scrolled:
+            self._ability_cards = [(x, y) for x, y, kind, _ in singles if kind == "hero"]
         self.log(f"Auto-deployed {sum(cd[3] for cd in troops)} troops ({len(troops)} types), "
                  f"{len(singles)} heroes/siege" + (f", {len(spells)} spell types." if spells else "."))
         return True
@@ -6944,7 +6998,7 @@ class App(tk.Tk):
             except OSError:
                 pass
             for name in ("debug_deploy.png", "debug_wall.png", "debug_boat.png", "debug_export.png", "debug_upgrade.png",
-                         "debug_accounts.png"):
+                         "debug_accounts.png", "debug_switch.png"):
                 path = os.path.join(BASE_DIR, name)
                 if os.path.exists(path) and time.time() - os.path.getmtime(path) < 6 * 3600:
                     img = cv2.imread(path)
