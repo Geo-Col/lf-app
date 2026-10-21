@@ -74,7 +74,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 82  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 83  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -147,6 +147,8 @@ OCR_REGIONS = [
 POINTS = [
     ("deploy_point", "Troop drop point (line start)"),
     ("deploy_line_end", "Troop line end (same side of the base)"),
+    ("deploy_point_2", "Troop line 2 start (optional, another side)"),
+    ("deploy_line_end_2", "Troop line 2 end (optional)"),
     ("spell_point", "Spell line start (optional)"),
     ("spell_line_end", "Spell line end (optional)"),
 ]
@@ -2101,7 +2103,8 @@ class Bot:
             dbg = self.shot().copy()
             bar = troop_bar(dbg)
             fp = c["fixed_points"]
-            cv2.line(dbg, tuple(a), tuple(b), (0, 210, 255), 6)
+            for la, lb in [(a, b)] + ([self.line2()] if self.line2() else []):
+                cv2.line(dbg, tuple(la), tuple(lb), (0, 210, 255), 6)
             if fp.get("spell_point"):
                 cv2.line(dbg, tuple(fp["spell_point"]), tuple(fp.get("spell_line_end") or fp["spell_point"]),
                          (255, 80, 220), 6)
@@ -4116,6 +4119,12 @@ class Bot:
         a = pts["deploy_point"]
         return a, pts.get("deploy_line_end") or a
 
+    def line2(self):
+        """The optional second troop line (another side of the base): (start, end), or None."""
+        pts = self.cfg["fixed_points"]
+        a = pts.get("deploy_point_2")
+        return (a, pts.get("deploy_line_end_2") or a) if a else None
+
     @staticmethod
     def along(a, b, k, n):
         """k-th of n points spread evenly from a to b (inclusive)."""
@@ -4171,13 +4180,23 @@ class Bot:
             self.tap((x, y), self.speed()[1])
             self.drop(sa, sb, n, None)
         delay = self.speed()[1]
-        for x, y, _, n in troops:  # every troop on the saved line - the camera pans to the same spot each battle
+        lines = [(a, b)] + ([self.line2()] if self.line2() else [])  # a second line: half of each troop there
+        for x, y, _, n in troops:  # every troop on the saved line(s) - the camera pans to the same spot each battle
             self.tap((x, y), delay)
-            self.drop(a, b, n, (x, y))
-        for k, (x, y, _, _) in enumerate(singles):  # heroes / siege spread evenly along the same line
-            if not fast_taps(self.adb, [(x, y)]) or not fast_taps(self.adb, [self.along(a, b, k, len(singles))]):
+            if len(lines) == 1:
+                self.drop(a, b, n, (x, y))
+                continue
+            first = (n + 1) // 2
+            for (la, lb), m in zip(lines, (first, n - first)):
+                if m:  # (no hold-until-empty check: the card has to keep some for the other line)
+                    self.drop(la, lb, m, None)
+        per = -(-len(singles) // len(lines))  # heroes / siege take turns between the lines, spread along each
+        for k, (x, y, _, _) in enumerate(singles):
+            la, lb = lines[k % len(lines)]
+            spot = self.along(la, lb, k // len(lines), per)
+            if not fast_taps(self.adb, [(x, y)]) or not fast_taps(self.adb, [spot]):
                 self.tap((x, y), delay)
-                self.adb.tap(*self.along(a, b, k, len(singles)))
+                self.adb.tap(*spot)
             self.sleep(0.1)
         # the bar again: anything still on it goes down - taps the game dropped, a spot on the line it doesn't
         # allow, or cards that didn't fit on the screen (a big army's bar scrolls: dragged along to show the rest)
@@ -4192,9 +4211,9 @@ class Bot:
             if left or idle:
                 self.log("Still on the bar after deploying: " + ", ".join(
                     [f"{cd[2]} x{cd[3]}" for cd in left] + [cd[2] for cd in idle]) + " - placing them now.", "warn")
-            for x, y, kind, n in left:
+            for i, (x, y, kind, n) in enumerate(left):
                 self.tap((x, y), max(delay, 0.2))
-                self.drop(*((sa, sb) if kind == "spell" else (a, b)), n, (x, y), retry=True)
+                self.drop(*((sa, sb) if kind == "spell" else lines[i % len(lines)]), n, (x, y), retry=True)
             for x, y, kind, _ in idle:
                 tapped.append(x)
                 self.tap((x, y), max(delay, 0.2))
@@ -5273,7 +5292,8 @@ class DropLinePicker(tk.Toplevel):
         bar = ttk.Frame(self, padding=S(12, 10))
         bar.pack(fill="x")
         ttk.Label(bar, text="On the scouting screen: 'Zoom out + pan', then click where the line STARTS and ENDS "
-                            "(grass outside the red border).").pack(side="left")
+                            "(grass outside the red border)." + ("  The other troop line shows in white; Clear + Save "
+                            "removes this one." if keys[0] != "deploy_point" else "")).pack(side="left")
         ttk.Button(bar, text="Save", style="Accent.TButton", command=self.save).pack(side="right")
         ttk.Button(bar, text="Refresh screenshot", command=self.refresh).pack(side="right", padx=S(8))
         ttk.Button(bar, text="Zoom out + pan + refresh", command=self.pan).pack(side="right")
@@ -5301,6 +5321,12 @@ class DropLinePicker(tk.Toplevel):
         self.cv.delete("all")
         self.cv.create_image(0, 0, anchor="nw", image=self.photo)
         k = self.scale
+        fp = self.app.cfg["fixed_points"]
+        other = {"deploy_point": ("deploy_point_2", "deploy_line_end_2"),
+                 "deploy_point_2": ("deploy_point", "deploy_line_end")}.get(self.keys[0])
+        if other and fp.get(other[0]):  # the other troop line, for reference: both should be on the same view
+            oa, ob = fp[other[0]], fp.get(other[1]) or fp[other[0]]
+            self.cv.create_line(oa[0] * k, oa[1] * k, ob[0] * k, ob[1] * k, fill="white", width=S(3), dash=(6, 4))
         a, b = self.pts
         if a and b:
             for w, col in ((S(8), "black"), (S(4), "#ffd21f")):  # dark outline so it shows on grass
@@ -5344,9 +5370,16 @@ class DropLinePicker(tk.Toplevel):
 
     def save(self):
         a, b = self.pts
+        fp = self.app.cfg["fixed_points"]
+        if not a and self.keys[0] == "deploy_point_2":  # cleared: no second line any more
+            fp.pop(self.keys[0], None)
+            fp.pop(self.keys[1], None)
+            save_config(self.app.cfg)
+            self.app.log("Troop line 2 removed - every troop goes on the first line.", "ok")
+            self.app.refresh_setup()
+            return self.destroy()
         if not a:
             return messagebox.showinfo("Drop line", "Click at least the start point.", parent=self)
-        fp = self.app.cfg["fixed_points"]
         self.app.cfg["line_view"] = 2  # picked on the zoomed-out view the bot deploys on (v17+)
         fp[self.keys[0]] = a
         if b:
@@ -6297,8 +6330,10 @@ class App(tk.Tk):
         ttk.Button(row, text="Capture", style="Accent.TButton", command=self.capture_point).pack(side="left")
         ttk.Button(row, text="Set troop line",
                    command=lambda: self.with_screenshot(lambda f: DropLinePicker(self, f))).pack(side="left", padx=S(8))
+        ttk.Button(row, text="Set troop line 2", command=lambda: self.with_screenshot(lambda f: DropLinePicker(
+            self, f, ("deploy_point_2", "deploy_line_end_2"), "Troop line 2"))).pack(side="left")
         ttk.Button(row, text="Set spell line", command=lambda: self.with_screenshot(lambda f: DropLinePicker(
-            self, f, ("spell_point", "spell_line_end"), "Spell"))).pack(side="left")
+            self, f, ("spell_point", "spell_line_end"), "Spell"))).pack(side="left", padx=S(8))
 
 
     def _scroll_area(self, parent):
