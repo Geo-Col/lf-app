@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 85  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 86  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -999,7 +999,8 @@ def troop_bar(frame):
             hh = cv2.cvtColor(frame[top:top + 45, a + 6:a + (b - a) // 3], cv2.COLOR_BGR2HSV)
             hdr = hh[:, :, 0][(hh[:, :, 1] > 90) & (hh[:, :, 2] > 90)]
             hue = np.median(hdr) if len(hdr) else 0  # blue troop ~104, purple spell ~126, red SUPER troop ~179
-            kind = "spell" if 115 <= hue <= 150 else "troop"
+            kind = "spell" if 115 <= hue <= 150 and cnt <= 15 else "troop"  # (no spell card holds more: a selected
+            # troop card's glow can look purple)
         out.append(((a + b) // 2, (ya + yb) // 2, kind, cnt))
     return out
 
@@ -2335,9 +2336,10 @@ class Bot:
         abilities = list(getattr(self, "_ability_cards", [])) if c["hero_abilities"] else []
         while time.time() - start < c["battle_max_wait"]:
             if abilities and time.time() - start >= c["hero_ability_delay"]:
-                for xy in abilities:  # a dead hero's greyed card just ignores the tap
-                    self.adb.tap(*xy)
-                    self.sleep(0.25)
+                if not fast_taps(self.adb, abilities, 0.05):  # one quick go (a dead hero's card ignores the tap)
+                    for xy in abilities:
+                        self.adb.tap(*xy)
+                        self.sleep(0.25)
                 self.log(f"Used {len(abilities)} hero abilities.")
                 abilities = []
             frame = self.shot()
@@ -2353,11 +2355,17 @@ class Bot:
             if dmg is None or dmg > 100:
                 dmg = self.read(frame, "damage_percent_region", min_digits=1, thorough=False)
             if dmg is not None and dmg <= 100 and dmg >= best - 5:  # damage never goes down
-                last_read = time.time()
+                prev, last_read = (last_read, best), time.time()
                 if dmg > best:
                     last_rise = last_read
                 best = self._dmg = max(best, dmg)
-                streak = streak + 1 if dmg >= c["surrender_damage_threshold"] else 0
+                # where the damage will be by the time a surrender goes through (~1 s: tap, the dialog, Okay) - a
+                # big army takes 10% a second near the end, so it's surrendered that much early. A reading far above
+                # the last one (a misread) needs a second look first
+                rate = min(12.0, max(0.0, (dmg - prev[1]) / max(0.3, last_read - prev[0])))
+                thr = c["surrender_damage_threshold"]
+                streak = streak + 1 if dmg + rate * 1.0 >= thr else 0
+                sure = streak >= c["damage_confirm_count"] or (streak and dmg - prev[1] <= 30)
                 self.emit("state", f"In battle - {dmg}% damage")
                 bt = getattr(self, "_battle", None)
                 if bt is not None:  # damage + loot still on the base, over time: what each surrender % would give
@@ -2365,8 +2373,10 @@ class Bot:
                     bt["curve"].append([round(time.time() - bt["time"], 1), best,
                                         *(white_number(frame, regs[r]) if regs.get(r) else None
                                           for r in ("loot_gold_region", "loot_elixir_region"))])
-                if streak >= c["damage_confirm_count"] and not (bt and bt["explore"]):
-                    self.log(f"{dmg}% damage reached - surrendering.", "ok")
+                if sure and not (bt and bt["explore"]):
+                    self.log(f"{dmg}% damage reached - surrendering" + (f" (rising {rate:.0f}% a second: it'd be "
+                             f"past {thr:.0f}% by the time it goes through)" if dmg < thr else "") + ".", "ok")
+                    self._surrender_at = self.find(frame, "surrender_button")  # tapped at once, no new look
                     if bt:
                         bt["how"] = "surrender"
                     break
@@ -2377,12 +2387,19 @@ class Bot:
                 if getattr(self, "_battle", None):
                     self._battle["how"] = "stall"
                 break
-            self.sleep(c["timer_poll_interval"])
+            # close to the surrender % (or one read already past it): look again straight away - every 2 s there
+            # let the battle run on several % past the target before the second read confirmed it
+            near = streak or best >= c["surrender_damage_threshold"] - 15
+            self.sleep(0 if near and not (getattr(self, "_battle", None) or {}).get("explore") else
+                       c["timer_poll_interval"])
         else:
             self.log(f"{c['battle_max_wait']:.0f}s battle limit - surrendering.")
-        self.pick_reward(self.shot())
+        quick, self._surrender_at = getattr(self, "_surrender_at", None), None
+        if not quick:
+            self.pick_reward(self.shot())
         for name in ("surrender_button", "surrender_confirm_button"):
-            hit = self.wait_for(name, 6) or c["coords"].get(name)
+            hit = (quick if name == "surrender_button" else None) or self.wait_for(name, 6, poll=0.2) \
+                or c["coords"].get(name)  # (the Okay slides in: look often)
             if not hit:
                 self.log(f"Couldn't find '{name}'.", "warn")
                 return
