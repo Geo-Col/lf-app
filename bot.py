@@ -44,6 +44,7 @@ import logging.handlers
 import os
 import platform
 import queue
+import random
 import re
 import secrets
 import shutil
@@ -74,13 +75,14 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 83  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 84  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
+ATTACK_LOG = os.path.join(BASE_DIR, "attack_log.jsonl")  # one line per attack: what auto-tune learns from
 # Shipped inside the bot folder so nothing needs installing (used when the configured path doesn't exist)
 BUNDLED = {"adb_path": os.path.join(BASE_DIR, "platform-tools", "adb.exe"),
            "tesseract_path": os.path.join(BASE_DIR, "Tesseract-OCR", "tesseract.exe")}
@@ -182,6 +184,7 @@ DEFAULTS = {
     "loot_gold_threshold": 700000,
     "loot_elixir_threshold": 700000,
     "loot_require_both": False,
+    "auto_tune": False,  # learn the skip + surrender amounts from this PC's own attacks (attack_log.jsonl)
     "loot_settle_delay": 2.5,
     "loot_recheck_delay": 1.5,
     "loot_max_plausible": 20000000,
@@ -214,6 +217,7 @@ DEFAULTS = {
     "bb_lab_upgrades": True,
     "bb_bonus_days": {},  # account -> date its daily Star Bonus was collected (no more attacks that day)
     "bank_spend_threshold": 15000000,
+    "walls_batch": 5,  # Walls mode: farm until this many walls are affordable, then buy them in one go
     "bank_scroll_duration_ms": 600,
     "bank_scroll_delay": 0.6,
     "bank_post_spend_delay": 1.0,
@@ -253,6 +257,7 @@ SETTINGS = [
     ("Loot", "Which bases are worth attacking.", [
         ("loot_force_attack", "Attack every base (skip loot check)", bool),
         ("loot_require_both", "Require gold AND elixir (off = either)", bool),
+        ("auto_tune", "Auto-tune: learn the skip + surrender amounts from my attacks", bool),
         ("loot_gold_threshold", "Minimum gold", int),
         ("loot_elixir_threshold", "Minimum elixir", int),
         ("loot_settle_delay", "Wait before first read (s)", float),
@@ -281,6 +286,7 @@ SETTINGS = [
         ("pets_upgrades_enabled", "Pet House: upgrade pets", bool),
         ("bank_spend_enabled", "Buy walls when storage is full", bool),
         ("bank_spend_threshold", "Spend when storage >=", int),
+        ("walls_batch", "Walls mode: buy once there's enough for N walls", int),
         ("bank_scroll_duration_ms", "List swipe duration (ms)", int),
         ("bank_scroll_delay", "Pause after swipe (s)", float),
         ("bank_post_spend_delay", "Pause after purchase (s)", float),
@@ -1258,6 +1264,81 @@ def export_items(data):
     return out
 
 
+def load_attacks():
+    """attack_log.jsonl's records (unreadable lines skipped)."""
+    out = []
+    try:
+        with open(ATTACK_LOG, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def tune_settings(recs, both, cur, force=False):
+    """The skip amount + surrender % that farm the most loot per hour on these recorded attacks:
+    ((threshold, surrender %, loot/s), loot/s of `cur` (gold threshold, elixir threshold, surrender %)) or None.
+    Loot/hour = (what a base offers on average (from every base looked at) x the share of it taken by that damage
+    (each battle's damage + loot-left curve) + the league win bonus at that damage - storage gain minus loot taken,
+    learnt apart for battles ending below / from 50%: a star pays it) / (searching for such a base + the battle up
+    to that damage + the time around every attack). ponytail: one threshold for gold and elixir, no dark elixir."""
+    recs = [r for r in recs if r.get("curve") and r.get("offered") and None not in r["offered"]]
+    bases = [b for r in recs for b in r.get("bases") or [] if len(b) == 2 and None not in b]
+    if len(recs) < 15 or len(bases) < 40:
+        return None
+    looked = sum(len(r.get("bases") or []) or 1 for r in recs if r.get("search_s") is not None)
+    per_base = sum(r["search_s"] for r in recs if r.get("search_s") is not None) / max(1, looked)
+    median = lambda xs, d: sorted(xs)[len(xs) // 2] if xs else d
+    around = median([r["t0"] - p["home"] for p, r in zip(recs, recs[1:]) if r.get("t0") and 0 < r["t0"] - p["home"] < 900],
+                    30) + median([r["home"] - r["time"] - r["curve"][-1][0] for r in recs
+                                  if 0 < r["home"] - r["time"] - r["curve"][-1][0] < 300], 15)
+
+    def extra(r):  # storage gain beyond the loot the battle took: the league bonus (+ the counter's lag)
+        pts = [p for p in r["curve"] if p[2] is not None and p[3] is not None]
+        if not r.get("gain") or not pts:
+            return None
+        return max(0, r["gain"][0] + r["gain"][1] - max(0, sum(r["offered"]) - pts[-1][2] - pts[-1][3]))
+
+    bonus = {}
+    for star in (False, True):
+        xs = [x for x in (extra(r) for r in recs if (r["curve"][-1][1] >= 50) == star) if x is not None]
+        bonus[star] = sum(xs) / len(xs) if xs else 0
+
+    def at(r, d):  # (share of the offered loot taken, seconds) had this battle been surrendered at d%
+        off = sum(r["offered"])
+        pts = [p for p in r["curve"] if p[2] is not None and p[3] is not None]
+        if not off or not pts:
+            return None
+        hit = next((p for p in pts if p[1] >= d), None)
+        if hit is None:
+            if r.get("how") == "surrender":
+                return None  # we stopped it before d ourselves: what comes after isn't known
+            hit = pts[-1]  # the troops were done before d: this is all it would have given
+        return min(1.0, max(0.0, (off - hit[2] - hit[3]) / off)), hit[0]
+
+    def rate(tg, te, d):
+        ok = [b for b in bases if (b[0] >= tg and b[1] >= te if both else b[0] >= tg or b[1] >= te)]
+        xs = [x for x in (at(r, d) for r in recs) if x]
+        if len(ok) < 8 or len(xs) < 8:
+            return None
+        share = sum(x[0] for x in xs) / len(xs)
+        secs = sum(x[1] for x in xs) / len(xs)
+        offered = sum(b[0] + b[1] for b in ok) / len(ok)
+        return (offered * share + bonus[d >= 50]) / (around + per_base * len(bases) / len(ok) + secs)
+
+    best = None
+    for t in [0] if force else range(0, 3_000_001, 50_000):
+        for d in range(20, 101, 5):
+            r = rate(t, t, d)
+            if r and (not best or r > best[2]):
+                best = (t, d, r)
+    return (best, rate(0 if force else cur[0], 0 if force else cur[1], cur[2])) if best else None
+
+
 def available_slots(frame, kind):
     """(normal, goblin) free slots, from the open panel's tab for this kind: its 'free/total' counter, and its
     icon - the green goblin face when only the (gem-costing) goblin builder / researcher is free."""
@@ -1339,6 +1420,33 @@ def card_deployed(frame, x):
                         cv2.COLOR_BGR2HSV)
     m = (band[:, :, 0] >= 40) & (band[:, :, 0] <= 80) & (band[:, :, 1] > 150) & (band[:, :, 2] > 170)
     return m.size > 0 and float(m.mean(axis=1).max()) >= 0.15
+
+
+# drop lines saved as a clicked path, and the start / end keys older versions (and the Setup points list) use
+LINE_KEYS = {"deploy_line": ("deploy_point", "deploy_line_end"), "deploy_line_2": ("deploy_point_2", "deploy_line_end_2"),
+             "spell_line": ("spell_point", "spell_line_end")}
+
+
+def fixed_path(fp, line):
+    """A saved drop line as its points: the clicked path, else its old start -> end (or one spot); [] if not set."""
+    if fp.get(line):
+        return [list(q) for q in fp[line]]
+    a, b = (fp.get(k) for k in LINE_KEYS[line])
+    return [list(a), list(b or a)] if a else []
+
+
+def path_point(path, f):
+    """The point a fraction f (0..1) of the way along a drop line through any number of points (by length)."""
+    if len(path) == 1:
+        return int(path[0][0]), int(path[0][1])
+    segs = [((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5 for a, b in zip(path, path[1:])]
+    d = max(0.0, min(1.0, f)) * sum(segs)
+    for i, n in enumerate(segs):
+        if d <= n or i == len(segs) - 1:
+            a, b = path[i], path[i + 1]
+            t = min(1.0, d / n) if n else 0.0
+            return int(a[0] + (b[0] - a[0]) * t), int(a[1] + (b[1] - a[1]) * t)
+        d -= n
 
 
 def icon_empty(frame, x, y, half=14):
@@ -1645,6 +1753,7 @@ class Bot:
         if pre and pre[0] == name and None not in now[:2] and None not in pre[1][:2]:
             gain = [max(0, (n or 0) - (p or 0)) if n is not None and p is not None else 0 for n, p in zip(now, pre[1])]
             self.note_full(name, gain, now)
+            self.record_attack(name, gain)
             if any(gain) and max(gain) <= 20_000_000:  # sanity: no single attack brings more
                 row = self.loot.setdefault(name, [0, 0, 0, 0])
                 for i, g in enumerate(gain):
@@ -1654,6 +1763,55 @@ class Bot:
                 self.log(f"{name}: +{gain[0]:,} gold, +{gain[1]:,} elixir, +{gain[2]:,} dark")
         self._cur = (name, now)
         return storage
+
+    def tune_count(self, what="all"):
+        """Attacks in attack_log.jsonl (what='explore': the ones that ran past the surrender %)."""
+        if "_tunes" not in self.__dict__:
+            recs = load_attacks()
+            self._tunes = {"all": len(recs), "explore": sum(1 for r in recs if r.get("explore"))}
+        return self._tunes[what]
+
+    def record_attack(self, name, gain):
+        """One line in attack_log.jsonl per home attack; every 10th, auto-tune has a look (when it's on)."""
+        bt, self._battle = getattr(self, "_battle", None), None
+        if not bt or not bt["curve"] or None in bt["offered"]:
+            return
+        rec = dict(bt, account=name, gain=gain, home=round(time.time(), 1))
+        try:
+            with open(ATTACK_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+        except OSError as e:
+            return log_file.warning(f"attack log: {e}")
+        self.tune_count()
+        self._tunes["all"] += 1
+        self._tunes["explore"] += bool(bt["explore"])
+        if self.cfg["auto_tune"] and self._tunes["all"] % 10 == 0:
+            self.auto_tune(name)
+
+    def auto_tune(self, name):
+        """Re-tune the skip amount + surrender % from the attacks so far (this account's, when it has enough of its
+        own - another Town Hall sees other bases). Small steps, and only for a real (3%+) gain."""
+        c = self.cfg
+        recs = load_attacks()[-400:]
+        mine = [r for r in recs if r.get("account") == name]
+        recs = mine if len(mine) >= 25 else recs
+        cur = (c["loot_gold_threshold"], c["loot_elixir_threshold"], c["surrender_damage_threshold"])
+        res = tune_settings(recs, c["loot_require_both"], cur, c["loot_force_attack"])
+        if not res:
+            return self.log(f"Auto-tune: still learning ({len(recs)} attacks so far, "
+                            f"{sum(1 for r in recs if r.get('explore'))} run past the surrender %).")
+        (t, d, rate), now_rate = res
+        if now_rate and rate < now_rate * 1.03:
+            return self.log(f"Auto-tune: skip below {cur[0]:,} / surrender at {cur[2]:.0f}% is already about the "
+                            f"best for these {len(recs)} attacks (~{now_rate * 3600 / 1e6:.1f}M loot / hour).", "ok")
+        step = lambda old, new, most: old + max(-most, min(most, new - old))  # small steps: the data can be noisy
+        nt, nd = int(step(max(cur[0], cur[1]), t, 300_000)), float(step(cur[2], d, 15))
+        c.update(loot_gold_threshold=nt, loot_elixir_threshold=nt, surrender_damage_threshold=nd)
+        save_config(c)
+        self.emit("settings", ["loot_gold_threshold", "loot_elixir_threshold", "surrender_damage_threshold"])
+        self.log(f"Auto-tune ({len(recs)} attacks): skip below {nt:,} (was {max(cur[0], cur[1]):,}), surrender at "
+                 f"{nd:.0f}% (was {cur[2]:.0f}%) - best found: {t:,} / {d:.0f}%, ~{rate * 3600 / 1e6:.1f}M loot / hour"
+                 + (f" vs ~{now_rate * 3600 / 1e6:.1f}M now." if now_rate else "."), "ok")
 
     def note_full(self, name, gain, now):
         """After an attack: a storage that barely rose (under 5% of the loot the base had) is full. Only real attacks
@@ -1689,6 +1847,7 @@ class Bot:
         return self.__dict__.get("_full", {}).get(name, False)
 
     def attack_now(self):
+        self._search = {"t0": time.time(), "bases": []}  # every base looked at from here to the attack
         self._pre = self._cur  # storage right before this attack
         self.tap(self.hits["attack_button"])
 
@@ -1844,7 +2003,12 @@ class Bot:
                 self.log("Every wall is max for this Town Hall - nothing left to buy. Stopping.", "ok")
                 self.stop_evt.set()
                 raise Abort()
-            if self.spend_bank(storage, price):
+            # every trip into the builder list costs ~30 s however many walls it buys: farm until N are
+            # affordable, then buy them in one go - but at once in a storage that looks full (loot would go to waste)
+            full = self.__dict__.get("_full_n", {}).get(self._last_name or "?", [0, 0, 0])
+            batch = max(1, int(self.cfg["walls_batch"]))
+            if self.spend_bank(storage, price and {c: price * (1 if full[i] else batch)
+                                                   for i, c in enumerate(("gold", "elixir"))}):
                 return
             if getattr(self, "_no_wall_rows", False):  # the builder list has no Wall row left
                 self.log("Every wall on this account is max - nothing left to buy. Stopping.", "ok")
@@ -1948,6 +2112,8 @@ class Bot:
             self.sleep(0.8)
             gold, elixir = self.read_loot(self.shot())
         self.emit("base", (gold, elixir))
+        if gold is not None and elixir is not None and getattr(self, "_search", None):
+            self._search["bases"].append([gold, elixir])
         if gold is None or elixir is None:
             self._unreadable += 1
             if self._unreadable >= 5:
@@ -2081,6 +2247,13 @@ class Bot:
     def attack(self, gold, elixir):
         self._offered = (gold, elixir)  # what the base had: a storage that then barely rises is full
         self._dmg = None  # the damage done (finish_battle): 0% = the troops never got in
+        s = getattr(self, "_search", None) or {}
+        # auto-tune needs to see what happens past the surrender %: some battles run until the troops are done
+        explore = bool(self.cfg["auto_tune"]) and random.random() < (0.3 if self.tune_count("explore") < 15 else 0.12)
+        self._battle = {"t0": s.get("t0"), "time": time.time(), "offered": [gold, elixir], "bases": s.get("bases", []),
+                        "search_s": round(time.time() - s["t0"], 1) if s.get("t0") else None, "curve": [],
+                        "explore": explore, "how": None, "surrender": self.cfg["surrender_damage_threshold"]}
+        self._search = None
         loot = f" - gold {gold:,} / elixir {elixir:,}" if gold is not None and elixir is not None else ""
         self.log(f"Attacking{loot}", "ok")
         self.bump("attacks")
@@ -2097,23 +2270,21 @@ class Bot:
             pan_view(self.adb, c["deploy_pan"])
         self._view = None
         self.sleep(0.3)
-        a, b = self.line()
+        path = self.line()
         bar = None
         try:  # what the bot saw + where it will drop: send this file if placement looks wrong
             dbg = self.shot().copy()
             bar = troop_bar(dbg)
-            fp = c["fixed_points"]
-            for la, lb in [(a, b)] + ([self.line2()] if self.line2() else []):
-                cv2.line(dbg, tuple(la), tuple(lb), (0, 210, 255), 6)
-            if fp.get("spell_point"):
-                cv2.line(dbg, tuple(fp["spell_point"]), tuple(fp.get("spell_line_end") or fp["spell_point"]),
-                         (255, 80, 220), 6)
+            for lp, col in ((path, (0, 210, 255)), (self.line2(), (0, 210, 255)),
+                            (fixed_path(c["fixed_points"], "spell_line"), (255, 80, 220))):
+                if lp:
+                    cv2.polylines(dbg, [np.array(lp, np.int32)], False, col, 6)
             for x, y, kind, n in bar:
                 cv2.putText(dbg, f"{kind} {n or ''}", (x - 60, y - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             cv2.imwrite(os.path.join(BASE_DIR, "debug_deploy.png"), dbg)
         except Exception as e:
             log_file.info(f"debug_deploy.png: {e}")
-        if self.auto_deploy(a, b, bar):
+        if self.auto_deploy(path, bar):
             return True
         # no troop bar: often the game was still / again searching (white clouds) - wait for the screen to settle
         for _ in range(8):
@@ -2125,7 +2296,7 @@ class Bot:
                 self._view = None
                 return False
             if troop_bar(f):
-                if self.auto_deploy(a, b):
+                if self.auto_deploy(path):
                     return True
                 break
         self.log("Couldn't read the troop bar - no troops deployed (see debug_deploy.png).", "err")
@@ -2149,6 +2320,8 @@ class Bot:
                 continue
             if self.find(frame, "return_home_button"):
                 self.log("Battle ended on its own.")
+                if getattr(self, "_battle", None):
+                    self._battle["how"] = "ended"
                 return
             box = c["ocr_regions"].get("damage_percent_region")
             dmg = (damage_percent(frame, box) if box else None)
@@ -2161,13 +2334,23 @@ class Bot:
                 best = self._dmg = max(best, dmg)
                 streak = streak + 1 if dmg >= c["surrender_damage_threshold"] else 0
                 self.emit("state", f"In battle - {dmg}% damage")
-                if streak >= c["damage_confirm_count"]:
+                bt = getattr(self, "_battle", None)
+                if bt is not None:  # damage + loot still on the base, over time: what each surrender % would give
+                    regs = c["ocr_regions"]
+                    bt["curve"].append([round(time.time() - bt["time"], 1), best,
+                                        *(white_number(frame, regs[r]) if regs.get(r) else None
+                                          for r in ("loot_gold_region", "loot_elixir_region"))])
+                if streak >= c["damage_confirm_count"] and not (bt and bt["explore"]):
                     self.log(f"{dmg}% damage reached - surrendering.", "ok")
+                    if bt:
+                        bt["how"] = "surrender"
                     break
             stalled = time.time() - last_rise
             limit = c["damage_stall_seconds"] if best > 0 else max(45, c["damage_stall_seconds"])  # troops still walking in
             if stalled > limit and time.time() - last_read < 3 * c["timer_poll_interval"] + 2:
                 self.log(f"Damage stuck at {best}% for {stalled:.0f}s - troops are done, surrendering.", "ok")
+                if getattr(self, "_battle", None):
+                    self._battle["how"] = "stall"
                 break
             self.sleep(c["timer_poll_interval"])
         else:
@@ -2292,8 +2475,10 @@ class Bot:
         return wiki_data()["home:wall"]["levels"][min(lv for lv in counts if lv < mx)]["cost"]
 
     def spend_bank(self, storage, threshold=None):
-        thr = threshold or self.cfg["bank_spend_threshold"]
-        if not any((storage.get(c) or 0) >= thr for c in ("gold", "elixir")):
+        """Walls from the storage above the threshold (one amount, or {'gold': .., 'elixir': ..})."""
+        thr = lambda c: (threshold.get(c) if isinstance(threshold, dict) else threshold) \
+            or self.cfg["bank_spend_threshold"]
+        if not any((storage.get(c) or 0) >= thr(c) for c in ("gold", "elixir")):
             return False
         if time.time() < self._bank_backoff.get("builder", 0):
             return False
@@ -2305,7 +2490,7 @@ class Bot:
         did = False
         for cur in ("gold", "elixir"):
             val = storage.get(cur)
-            if val is None or val < (threshold or self.cfg["bank_spend_threshold"]):
+            if val is None or val < thr(cur):
                 continue
             if time.time() < self._bank_backoff.get(cur, 0):
                 continue
@@ -4114,16 +4299,17 @@ class Bot:
         return False
 
     def line(self):
-        """Drop line: deploy_point -> deploy_line_end (if captured), else just the one point."""
-        pts = self.cfg["fixed_points"]
-        a = pts["deploy_point"]
-        return a, pts.get("deploy_line_end") or a
+        """The troop drop line: its points (clicked in Setup), or the one spot."""
+        return fixed_path(self.cfg["fixed_points"], "deploy_line")
 
     def line2(self):
-        """The optional second troop line (another side of the base): (start, end), or None."""
-        pts = self.cfg["fixed_points"]
-        a = pts.get("deploy_point_2")
-        return (a, pts.get("deploy_line_end_2") or a) if a else None
+        """The optional second troop line (another side of the base): its points, or None."""
+        return fixed_path(self.cfg["fixed_points"], "deploy_line_2") or None
+
+    @staticmethod
+    def spread(path, k, n):
+        """k-th of n spots spread evenly along a drop line (both ends included)."""
+        return path_point(path, k / (n - 1) if n > 1 else 0.5)
 
     @staticmethod
     def along(a, b, k, n):
@@ -4135,25 +4321,26 @@ class Bot:
         """(pause between taps, pause after picking a card) for the chosen placing speed."""
         return DEPLOY_SPEEDS.get(self.cfg.get("deploy_speed"), DEPLOY_SPEEDS["Fastest"])
 
-    def drop(self, a, b, n, card, retry=False):
-        """Deploy n of the selected unit as taps spread evenly along a->b. Never drags: a moving touch scrolls the
-        view instead of placing troops. With a single spot (a == b) and hold-to-deploy, a still long-press is used.
+    def drop(self, path, n, card, retry=False):
+        """Deploy n of the selected unit as taps spread evenly along a drop line. Never drags: a moving touch
+        scrolls the view instead of placing troops. A single spot with hold-to-deploy: a still long-press.
         retry: units the first go missed - slower taps, between the first go's spots (one may not allow troops)."""
         c = self.cfg
         if retry:
-            pts = [self.along(a, b, k + 0.5, n + 1) for k in range(n)]
+            pts = [path_point(path, (k + 0.5) / n) for k in range(n)]
             for i in range(0, n, 20):
                 self.adb.shell("; sleep 0.1; ".join(f"input tap {x} {y}" for x, y in pts[i:i + 20]),
                                timeout=10 + 2 * len(pts[i:i + 20]))
             return
-        if a == b and c["hold_deploy"] and n >= 3 and card:
+        a = path[0]
+        if len({tuple(q) for q in path}) == 1 and c["hold_deploy"] and n >= 3 and card:
             ms = min(n * c["hold_ms_per_troop"], 8000)
             for _ in range(3):
                 self.adb.swipe(a[0], a[1], a[0], a[1], ms)
                 if icon_empty(self.shot(), *card):
                     break
             return
-        pts = [self.along(a, b, k, n) for k in range(n)]
+        pts = [self.spread(path, k, n) for k in range(n)]
         gap = self.speed()[0]
         if fast_taps(self.adb, pts, gap):
             return
@@ -4162,7 +4349,7 @@ class Bot:
             chunk = pts[i:i + 20]
             self.adb.shell(f"; sleep {gap}; ".join(f"input tap {x} {y}" for x, y in chunk), timeout=10 + len(chunk))
 
-    def auto_deploy(self, a, b, cards=None):
+    def auto_deploy(self, path, cards=None):
         """Read this account's troop bar and deploy it: spells first (if enabled), then every troop card (all of
         it), then every hero / siege machine / pet (one tap each)."""
         cards = cards or troop_bar(self.shot())  # the deploy's debug read, when there was one
@@ -4171,29 +4358,25 @@ class Bot:
         singles = [cd for cd in cards if cd[2] in ("hero", "single")]
         if not troops and not singles and not spells:
             return False
-        fp = self.cfg["fixed_points"]
-        if fp.get("spell_point"):  # their own line, if set
-            sa, sb = fp["spell_point"], fp.get("spell_line_end") or fp["spell_point"]
-        else:  # else around the middle of the troop line
-            sa, sb = self.along(a, b, 1, 4), self.along(a, b, 2, 4)
+        # spells: their own line if set, else around the middle of the troop line
+        spl = fixed_path(self.cfg["fixed_points"], "spell_line") or [path_point(path, 0.33), path_point(path, 0.67)]
         for x, y, _, n in spells:  # spells FIRST, as taps spread along their line (a hold doesn't cast them)
             self.tap((x, y), self.speed()[1])
-            self.drop(sa, sb, n, None)
+            self.drop(spl, n, None)
         delay = self.speed()[1]
-        lines = [(a, b)] + ([self.line2()] if self.line2() else [])  # a second line: half of each troop there
+        lines = [path] + ([self.line2()] if self.line2() else [])  # a second line: half of each troop there
         for x, y, _, n in troops:  # every troop on the saved line(s) - the camera pans to the same spot each battle
             self.tap((x, y), delay)
             if len(lines) == 1:
-                self.drop(a, b, n, (x, y))
+                self.drop(path, n, (x, y))
                 continue
             first = (n + 1) // 2
-            for (la, lb), m in zip(lines, (first, n - first)):
+            for lp, m in zip(lines, (first, n - first)):
                 if m:  # (no hold-until-empty check: the card has to keep some for the other line)
-                    self.drop(la, lb, m, None)
+                    self.drop(lp, m, None)
         per = -(-len(singles) // len(lines))  # heroes / siege take turns between the lines, spread along each
         for k, (x, y, _, _) in enumerate(singles):
-            la, lb = lines[k % len(lines)]
-            spot = self.along(la, lb, k // len(lines), per)
+            spot = self.spread(lines[k % len(lines)], k // len(lines), per)
             if not fast_taps(self.adb, [(x, y)]) or not fast_taps(self.adb, [spot]):
                 self.tap((x, y), delay)
                 self.adb.tap(*spot)
@@ -4213,11 +4396,11 @@ class Bot:
                     [f"{cd[2]} x{cd[3]}" for cd in left] + [cd[2] for cd in idle]) + " - placing them now.", "warn")
             for i, (x, y, kind, n) in enumerate(left):
                 self.tap((x, y), max(delay, 0.2))
-                self.drop(*((sa, sb) if kind == "spell" else lines[i % len(lines)]), n, (x, y), retry=True)
+                self.drop(spl if kind == "spell" else lines[i % len(lines)], n, (x, y), retry=True)
             for x, y, kind, _ in idle:
                 tapped.append(x)
                 self.tap((x, y), max(delay, 0.2))
-                self.adb.tap(*self.along(a, b, 1, 2))
+                self.adb.tap(*path_point(path, 0.5))
                 self.sleep(0.2)
             full = bar and "empty" not in [cd[2] for cd in bar] and max(cd[0] for cd in bar) > f.shape[1] * 0.85
             if not left and not idle:
@@ -4434,7 +4617,7 @@ padding:10px 12px;background:#2a2f3a;color:#e9e9ec}
 max-height:260px;overflow:auto}
 @media(max-width:420px){.r4{grid-template-columns:repeat(2,1fr)}}
 </style></head><body><div class="wrap">
-<header><img id="logo"><div><h1>Loot Farmer</h1><div class="sub" id="mode">&hellip;</div></div>
+<header><img id="logo"><div><h1>Loot Farmer</h1><div class="sub" id="mode">&hellip;</div><div class="sub" id="tune"></div></div>
 <div class="pill idle" id="state">&hellip;</div></header>
 <img id="f" alt="">
 <div class="card ctl"><select id="m"></select><button id="go" class="go">Start</button>
@@ -4491,7 +4674,8 @@ for(const[,fs]of S)for(const[k,,t,v]of fs){const i=L.querySelector(`[data-k="${k
 if(t=="bool")i.checked=!!v;else if(String(i.value)!==String(v))i.value=v;}}
 async function tick(){try{const s=await (await fetch("status"+Q,{cache:"no-store"})).json();
 const st=$("state");st.textContent=s.state;st.className="pill"+(/idle|stopped/i.test(s.state)?" idle":/recover/i.test(s.state)?" off":"");
-$("mode").textContent=s.mode?"Mode: "+s.mode:"";
+$("mode").textContent=s.mode?"Mode: "+s.mode:"";$("tune").textContent=s.tune?"Auto-tune "+s.tune:"";
+$("tune").style.color=/^ON/.test(s.tune||"")?"#f5c542":"#9a9a9a";
 if(s.modes&&!$("m").options.length)$("m").innerHTML=s.modes.map(([v,ms])=>`<optgroup label="${v}">`+
 ms.map(([k,l])=>`<option value="${k}">${l}</option>`).join("")+"</optgroup>").join("");
 fillSet(s.settings||[]);
@@ -4528,10 +4712,10 @@ PHONE_ACTIONS = ("start", "stop", "pause", "restart_game", "switch_account", "lo
                  "set_rotation", "send_report", "scan_upgrades")
 PHONE_OPTIONS = ("rotate_accounts", "builder_base_enabled")  # Farm & Upgrade's two switches, by the mode picker
 # what the phone's Settings can change: gameplay only - never paths, keys, ports or anything that starts a program
-PHONE_SETTINGS = ("loot_force_attack", "loot_require_both", "loot_gold_threshold", "loot_elixir_threshold",
+PHONE_SETTINGS = ("auto_tune", "loot_force_attack", "loot_require_both", "loot_gold_threshold", "loot_elixir_threshold",
                   "deploy_spells", "deploy_speed", "hero_abilities", "surrender_damage_threshold", "battle_max_wait",
                   "builder_upgrades_enabled", "skip_town_hall", "lab_upgrades_enabled", "pets_upgrades_enabled",
-                  "bank_spend_enabled", "bank_spend_threshold", "builder_base_enabled", "bb_attacks_enabled",
+                  "bank_spend_enabled", "bank_spend_threshold", "walls_batch", "builder_base_enabled", "bb_attacks_enabled",
                   "bb_builder_upgrades", "bb_lab_upgrades", "bb_visit_hours", "rotate_accounts", "stop_when_all_busy")
 SETTING_KIND = {k: (label, kind) for _, _, fs in SETTINGS for k, label, kind in fs}
 
@@ -5278,32 +5462,37 @@ class Pill(tk.Canvas):
 
 
 class DropLinePicker(tk.Toplevel):
-    """Click to pin-point the troop drop line on a live screenshot. 1st click = start, 2nd = end, further clicks
-    move whichever marker is nearer. Refresh grabs a new screenshot (e.g. once you're on the scouting screen)."""
+    """Draw a drop line on a live screenshot: every click adds the next point - as many as you like, so the line
+    can follow the base's edge round a corner. Drag a point to move it, right-click one to delete it. Refresh grabs
+    a new screenshot (e.g. once you're on the scouting screen)."""
 
-    def __init__(self, app, frame, keys=("deploy_point", "deploy_line_end"), what="Troop"):
+    def __init__(self, app, frame, line="deploy_line", what="Troop"):
         super().__init__(app)
-        self.app, self.keys, self.what = app, keys, what
+        self.app, self.line, self.what = app, line, what
         self.title(f"{what} drop line")
         self.configure(bg=BG)
-        fp = app.cfg["fixed_points"]
-        self.pts = [fp.get(keys[0]), fp.get(keys[1])]
-        self.pts = [list(p) if p else None for p in self.pts]
+        self.pts, self.grab = fixed_path(app.cfg["fixed_points"], line), None
+        if len(self.pts) == 2 and self.pts[0] == self.pts[1]:
+            self.pts = self.pts[:1]  # one spot
         bar = ttk.Frame(self, padding=S(12, 10))
         bar.pack(fill="x")
-        ttk.Label(bar, text="On the scouting screen: 'Zoom out + pan', then click where the line STARTS and ENDS "
-                            "(grass outside the red border)." + ("  The other troop line shows in white; Clear + Save "
-                            "removes this one." if keys[0] != "deploy_point" else "")).pack(side="left")
+        ttk.Label(bar, text="On the scouting screen: 'Zoom out + pan', then click along the grass outside the base.",
+                  style="Muted.TLabel").pack(side="left")
         ttk.Button(bar, text="Save", style="Accent.TButton", command=self.save).pack(side="right")
         ttk.Button(bar, text="Refresh screenshot", command=self.refresh).pack(side="right", padx=S(8))
         ttk.Button(bar, text="Zoom out + pan + refresh", command=self.pan).pack(side="right")
-        ttk.Button(bar, text="Clear", command=self.clear).pack(side="right")
+        ttk.Button(bar, text="Clear", command=self.clear).pack(side="right", padx=S(8))
+        ttk.Button(bar, text="Undo point", command=self.undo).pack(side="right")
         self.info = ttk.Label(self, style="Muted.TLabel", padding=S(12, 0, 12, 6))
         self.info.pack(anchor="w")
         self.cv = tk.Canvas(self, highlightthickness=0, bg=BG, cursor="crosshair")
         self.cv.pack(padx=S(12), pady=S(0, 12))
-        self.cv.bind("<Button-1>", self.click)
+        self.cv.bind("<ButtonPress-1>", self.press)
+        self.cv.bind("<B1-Motion>", self.move)
+        self.cv.bind("<ButtonRelease-1>", lambda e: setattr(self, "grab", None))
+        self.cv.bind("<Button-3>", self.remove)
         self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Control-z>", lambda e: self.undo())
         self.show(frame)
         self.transient(app)
         self.focus_set()
@@ -5322,39 +5511,62 @@ class DropLinePicker(tk.Toplevel):
         self.cv.create_image(0, 0, anchor="nw", image=self.photo)
         k = self.scale
         fp = self.app.cfg["fixed_points"]
-        other = {"deploy_point": ("deploy_point_2", "deploy_line_end_2"),
-                 "deploy_point_2": ("deploy_point", "deploy_line_end")}.get(self.keys[0])
-        if other and fp.get(other[0]):  # the other troop line, for reference: both should be on the same view
-            oa, ob = fp[other[0]], fp.get(other[1]) or fp[other[0]]
-            self.cv.create_line(oa[0] * k, oa[1] * k, ob[0] * k, ob[1] * k, fill="white", width=S(3), dash=(6, 4))
-        a, b = self.pts
-        if a and b:
+        for other in ("deploy_line", "deploy_line_2"):  # the other troop line, for reference (same view)
+            op = fixed_path(fp, other) if other != self.line else []
+            if len(op) > 1:
+                self.cv.create_line(*[v * k for q in op for v in q], fill="white", width=S(3), dash=(6, 4))
+        if len(self.pts) > 1:
             for w, col in ((S(8), "black"), (S(4), "#ffd21f")):  # dark outline so it shows on grass
-                self.cv.create_line(a[0] * k, a[1] * k, b[0] * k, b[1] * k, fill=col, width=w, capstyle="round")
-        r = S(11)
-        for p, label, col in ((a, "START", GREEN), (b, "END", BLUE)):
-            if p:
-                x, y = p[0] * k, p[1] * k
-                self.cv.create_oval(x - r, y - r, x + r, y + r, outline="white", width=S(3), fill=col)
-                for dx, dy, c in ((2, 2, "black"), (0, 0, "white")):
-                    self.cv.create_text(x + r + 6 + dx, y - r - 6 + dy, text=label, fill=c, anchor="w",
-                                        font=("Segoe UI", 12, "bold"))
-        self.info.config(text=f"Start: {tuple(a) if a else '-'}     End: {tuple(b) if b else '- (one spot only)'}")
+                self.cv.create_line(*[v * k for q in self.pts for v in q], fill=col, width=w, capstyle="round",
+                                    joinstyle="round")
+        r = S(10)
+        for i, q in enumerate(self.pts):
+            x, y = q[0] * k, q[1] * k
+            col = GREEN if i == 0 else BLUE if i == len(self.pts) - 1 else GOLD
+            self.cv.create_oval(x - r, y - r, x + r, y + r, outline="white", width=S(2), fill=col)
+            label = "START" if i == 0 else "END" if i == len(self.pts) - 1 else str(i + 1)
+            for dx, dy, c in ((2, 2, "black"), (0, 0, "white")):
+                self.cv.create_text(x + r + 5 + dx, y - r - 5 + dy, text=label, fill=c, anchor="w",
+                                    font=("Segoe UI", 11, "bold"))
+        n = len(self.pts)
+        self.info.config(text=("No points yet - click where the line starts." if not n else
+                               "1 point: every troop goes on that one spot - click on to make a line." if n == 1 else
+                               f"{n} points - troops are spread evenly along the whole line.")
+                         + "   Each click adds the next point · drag a point to move it · right-click removes it.")
 
-    def click(self, e):
-        p = [int(e.x / self.scale), int(e.y / self.scale)]
-        a, b = self.pts
-        if not a:
-            self.pts[0] = p
-        elif not b:
-            self.pts[1] = p
-        else:  # move the nearer marker
-            near = min((0, 1), key=lambda i: (self.pts[i][0] - p[0]) ** 2 + (self.pts[i][1] - p[1]) ** 2)
-            self.pts[near] = p
+    def near(self, e):
+        """Index of the point under the mouse, or None."""
+        r = S(14)
+        hits = [(abs(q[0] * self.scale - e.x) + abs(q[1] * self.scale - e.y), i) for i, q in enumerate(self.pts)]
+        d, i = min(hits, default=(r * 9, None))
+        return i if d <= r * 1.5 else None
+
+    def press(self, e):
+        i = self.near(e)
+        if i is None:  # empty ground: the next point of the line
+            self.pts.append([int(e.x / self.scale), int(e.y / self.scale)])
+            i = len(self.pts) - 1
+        self.grab = i
         self.draw()
 
+    def move(self, e):
+        if self.grab is not None:
+            self.pts[self.grab] = [int(e.x / self.scale), int(e.y / self.scale)]
+            self.draw()
+
+    def remove(self, e):
+        i = self.near(e)
+        if i is not None:
+            self.pts.pop(i)
+            self.draw()
+
+    def undo(self):
+        if self.pts:
+            self.pts.pop()
+            self.draw()
+
     def clear(self):
-        self.pts = [None, None]
+        self.pts = []
         self.draw()
 
     def refresh(self):
@@ -5369,25 +5581,22 @@ class DropLinePicker(tk.Toplevel):
                              self.app.ui(self.refresh)))
 
     def save(self):
-        a, b = self.pts
         fp = self.app.cfg["fixed_points"]
-        if not a and self.keys[0] == "deploy_point_2":  # cleared: no second line any more
-            fp.pop(self.keys[0], None)
-            fp.pop(self.keys[1], None)
-            save_config(self.app.cfg)
-            self.app.log("Troop line 2 removed - every troop goes on the first line.", "ok")
-            self.app.refresh_setup()
-            return self.destroy()
-        if not a:
-            return messagebox.showinfo("Drop line", "Click at least the start point.", parent=self)
-        self.app.cfg["line_view"] = 2  # picked on the zoomed-out view the bot deploys on (v17+)
-        fp[self.keys[0]] = a
-        if b:
-            fp[self.keys[1]] = b
-        else:
-            fp.pop(self.keys[1], None)
+        start, end = LINE_KEYS[self.line]
+        if not self.pts and self.line == "deploy_line":
+            return messagebox.showinfo("Drop line", "Click at least one point.", parent=self)
+        for key in (self.line, start, end):
+            fp.pop(key, None)
+        if self.pts:
+            fp[self.line] = self.pts
+            fp[start] = self.pts[0]  # (the Setup points list + older versions)
+            if len(self.pts) > 1:
+                fp[end] = self.pts[-1]
+            self.app.cfg["line_view"] = 2  # picked on the zoomed-out view the bot deploys on (v17+)
         save_config(self.app.cfg)
-        self.app.log(f"{self.what} drop line saved: {tuple(a)} -> {tuple(b) if b else 'single spot'}.", "ok")
+        self.app.log(f"{self.what} line saved: {len(self.pts)} point{'s' if len(self.pts) != 1 else ''}." if self.pts
+                     else f"{self.what} line removed" + (" - every troop goes on the first line." if
+                                                         self.line == "deploy_line_2" else "."), "ok")
         self.app.refresh_setup()
         self.destroy()
 
@@ -6100,6 +6309,14 @@ class App(tk.Tk):
         self.rot_btn["menu"] = self.rot_menu
         self.rot_vars = {}
         self.fill_rot_menu()
+        # auto-tune: on/off right by the modes that attack at home, with what it's using and has learnt from
+        self.tune_row = tk.Frame(modes, bg=BG)
+        self.tune_var = tk.BooleanVar(value=bool(self.cfg["auto_tune"]))
+        ttk.Checkbutton(self.tune_row, text="Auto-tune skip + surrender", variable=self.tune_var,
+                        command=self.flip_tune, style="Bg.Switch.TCheckbutton").pack(side="left")
+        self.tune_lbl = tk.Label(self.tune_row, bg=BG, font=("Segoe UI", 9, "bold"), anchor="w")
+        self.tune_lbl.pack(side="left", padx=S(10, 0))
+        self.show_tune()
         self.pick_mode(self.mode_var.get(), save=False)
 
         nb = self.nb = ttk.Notebook(main, style="Hidden.TNotebook")  # pages; the sidebar is the tab row
@@ -6149,6 +6366,41 @@ class App(tk.Tk):
             m.add_command(label="Select all", command=lambda: self.set_rotation(accs))
         m.add_command(label="↻  Rescan accounts", command=lambda: self.phone_cmd({"action": "load_accounts"}))
 
+    def tune_text(self):
+        """'ON · skip below 700k · surrender at 90% · learnt from 20 attacks' / 'OFF · ...' (also on the phone)."""
+        c = self.cfg
+        short = lambda v: f"{v / 1e6:.2f}".rstrip("0").rstrip(".") + "M" if v >= 1e6 else f"{v / 1e3:.0f}k"
+        try:
+            mt = os.path.getmtime(ATTACK_LOG)
+        except OSError:
+            mt = None
+        if getattr(self, "_tune_mt", 0) != mt:  # (the attack log is only re-counted when it changes)
+            self._tune_mt, self._tune_n = mt, len(load_attacks()) if mt else 0
+        skip = "attacks every base" if c["loot_force_attack"] else \
+            f"skip below {short(max(c['loot_gold_threshold'], c['loot_elixir_threshold']))}"
+        now = f"{skip} · surrender at {c['surrender_damage_threshold']:.0f}%"
+        n = self._tune_n
+        if not c["auto_tune"]:
+            return f"OFF · {now} (your own settings)" + (f" · {n} attacks recorded" if n else "")
+        return f"ON · {now} · " + (f"learnt from {n} attacks" if n >= 15 else
+                                   f"learning: {n} of 15 attacks before it adjusts anything")
+
+    def show_tune(self):
+        on = bool(self.cfg["auto_tune"])
+        if self.tune_var.get() != on:
+            self.tune_var.set(on)
+        self.tune_lbl.config(text=("🧠  " if on else "") + self.tune_text(), fg=GOLD if on else MUTED)
+
+    def flip_tune(self):
+        self.cfg["auto_tune"] = self.tune_var.get()  # the running bot shares this dict: takes effect at once
+        if "auto_tune" in getattr(self, "svars", {}):
+            self.load_settings_vars(["auto_tune"])
+        save_config(self.cfg)
+        self.log("Auto-tune on: the skip amount and surrender % now follow what farms the most loot per hour on "
+                 "your own attacks (checked every 10 attacks)." if self.cfg["auto_tune"] else
+                 "Auto-tune off: your own skip amount and surrender % are used as they are.", "ok")
+        self.show_tune()
+
     def set_start(self, state):
         """The big button: Start (gold) / Stop (red) / Stopping... (greyed, not clickable)."""
         text, fill, hover, fg = {"start": ("▶   Start", GOLD, "#ffcf6e", "#1b1405"),
@@ -6171,6 +6423,10 @@ class App(tk.Tk):
             self.rot_row.pack(fill="x", pady=S(6, 0))
         else:
             self.rot_row.pack_forget()
+        if not m.startswith("bb_"):  # the modes that attack at home
+            self.tune_row.pack(fill="x", pady=S(6, 0))
+        else:
+            self.tune_row.pack_forget()
         self.set_start("start")
         if save and self.cfg.get("ui_mode") != m:
             self.cfg["ui_mode"] = m
@@ -6331,9 +6587,9 @@ class App(tk.Tk):
         ttk.Button(row, text="Set troop line",
                    command=lambda: self.with_screenshot(lambda f: DropLinePicker(self, f))).pack(side="left", padx=S(8))
         ttk.Button(row, text="Set troop line 2", command=lambda: self.with_screenshot(lambda f: DropLinePicker(
-            self, f, ("deploy_point_2", "deploy_line_end_2"), "Troop line 2"))).pack(side="left")
+            self, f, "deploy_line_2", "Second troop"))).pack(side="left")
         ttk.Button(row, text="Set spell line", command=lambda: self.with_screenshot(lambda f: DropLinePicker(
-            self, f, ("spell_point", "spell_line_end"), "Spell"))).pack(side="left", padx=S(8))
+            self, f, "spell_line", "Spell"))).pack(side="left", padx=S(8))
 
 
     def _scroll_area(self, parent):
@@ -6468,6 +6724,10 @@ class App(tk.Tk):
                     data()
                 elif kind == "accounts":
                     self.fill_rot_menu()
+                elif kind == "settings":  # auto-tune changed these
+                    if getattr(self, "svars", None):
+                        self.load_settings_vars(data)
+                    self.show_tune()
                 elif kind == "scan":
                     self.render_walls()
                     p = getattr(self, "planner", None)
@@ -6509,6 +6769,8 @@ class App(tk.Tk):
                                    for k, label, kind in fs if k in PHONE_SETTINGS]] for g, _, fs in SETTINGS
                               if any(k in PHONE_SETTINGS for k, _, _ in fs)]
             st["rotation"] = self.rotation()[1]
+            st["tune"] = self.tune_text()
+            self.show_tune()
             st["resume_in"] = max(0, int(self._resume[0] - time.time())) if self._resume else 0
             st["accounts"] = [[a["sc"], (f"{a['game']} · {a['sc']}" if a.get("game") and a["game"] not in a["sc"]
                                          else a["sc"])
@@ -7128,6 +7390,7 @@ class App(tk.Tk):
         for key, v in getattr(self, "opt_vars", {}).items():
             v.set(bool(self.cfg[key]))
         self.adb.path = self.cfg["adb_path"]
+        self.show_tune()
         if HAVE_TESS:
             pytesseract.pytesseract.tesseract_cmd = self.cfg["tesseract_path"]
         save_config(self.cfg)
@@ -7236,6 +7499,9 @@ class App(tk.Tk):
 
     def _save_point(self, n, center):
         self.cfg["fixed_points"][n] = list(center)
+        for line, keys in LINE_KEYS.items():  # a start / end set by hand: that line is start -> end again
+            if n in keys:
+                self.cfg["fixed_points"].pop(line, None)
         save_config(self.cfg)
         self.log(f"Saved point '{n}' at {center}.", "ok")
         self.refresh_setup()
@@ -7370,6 +7636,26 @@ def selftest():
     assert not hit([0, 0, 0]) and not hit([0, 0, 900], offer=(20_000, 400_000))  # 1 attack / dark rose
     assert not hit([0, 0, 0]) and hit([5_000, 0, 0])  # dark's 2nd attack; +5k of 400k gold = under 5%
     assert not hit([300_000, 0, 0])  # rose again: not full
+    # drop lines through any number of points: spread by length; old start/end saves still work
+    pth = [[0, 0], [100, 0], [100, 300]]  # 400 long
+    assert path_point(pth, 0) == (0, 0) and path_point(pth, 0.25) == (100, 0) and path_point(pth, 1) == (100, 300)
+    assert path_point(pth, 0.5) == (100, 100) and path_point([[5, 5]], 0.7) == (5, 5)
+    assert fixed_path({"deploy_point": [1, 2], "deploy_line_end": [3, 4]}, "deploy_line") == [[1, 2], [3, 4]]
+    assert fixed_path({"deploy_point": [1, 2]}, "deploy_line") == [[1, 2], [1, 2]]
+    assert fixed_path({"deploy_line": pth, "deploy_point": [9, 9]}, "deploy_line") == pth
+    assert fixed_path({}, "deploy_line_2") == []
+    # auto-tune on made-up attacks: loot stops coming at 60% damage (1% a second), bases 100k-2M each
+    rng, recs = random.Random(1), []
+    for i in range(60):
+        bases = [[rng.randrange(100_000, 2_000_000), rng.randrange(100_000, 2_000_000)] for _ in range(5)]
+        g, e = bases[-1]
+        stop = 100 if i % 3 == 0 else 50  # a third ran past the surrender %
+        curve = [[d, d, int(g * (1 - 0.9 * min(1, d / 60))), int(e * (1 - 0.9 * min(1, d / 60)))]
+                 for d in range(2, stop + 1, 2)]
+        recs.append({"t0": i * 200, "time": i * 200 + 30, "home": i * 200 + 30 + stop + 15, "bases": bases,
+                     "search_s": 30, "offered": [g, e], "curve": curve, "how": "stall" if stop == 100 else "surrender"})
+    (t, d, r), now = tune_settings(recs, False, (0, 0, 50))
+    assert 55 <= d <= 65 and t > 0 and r > now, (t, d, r, now)
     # the phone may only set gameplay settings, each with a value of its type
     assert phone_value("hero_abilities", False) is False and phone_value("loot_gold_threshold", 900000.0) == 900000
     assert phone_value("deploy_speed", "Slow") == "Slow" and phone_value("surrender_damage_threshold", 60) == 60.0
