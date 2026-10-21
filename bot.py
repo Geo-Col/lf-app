@@ -74,7 +74,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 81  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 82  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1270,10 +1270,11 @@ def available_slots(frame, kind):
     return free, 0
 
 
-def list_rows(frame):
+def list_rows(frame, keep=None):
     """Rows of the open upgrade panel: [(name, price, affordable, (x, y))]. Each row is a card: name (white;
     green = a new building to place, returned as 'New ...'), timer, and the price under it - white when you can
-    afford it, red when you can't. Upgrades in progress (green bars) and section headers have no price."""
+    afford it, red when you can't. Upgrades in progress (green bars) and section headers have no price.
+    keep(price) False: that row's name isn't read (Tesseract is the slow part) - it comes back as None."""
     box = panel_box(frame)
     if not box or not HAVE_TESS:
         return []
@@ -1307,6 +1308,9 @@ def list_rows(frame):
         na, nb = max(0, ya - int(52 * k)), max(0, ya - int(6 * k))  # the name line sits just above the price
         if nb - na < 20 * k:
             continue  # name cut off at the top edge
+        if keep and not keep(price):
+            out.append((None, price, not is_red, (x0 + int(200 * k), py0 + (na + nb) // 2)))
+            continue
         nm = (white | green)[na:nb, nx0:nx1].astype(np.uint8) * 255
         s = 48 / nm.shape[0]
         nm = cv2.resize(nm, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
@@ -2389,25 +2393,46 @@ class Bot:
         icon = top_bar(self.shot(), kind)[0]
         # 1) the whole list once: every 'Wall xN' level and its price (the list's order changes between openings -
         #    a 'Suggested' section moves rows around - so the first Wall row seen isn't necessarily the one to buy)
+        #    Faster when this account's walls are known (planner scan): the lowest level's row - its price at any
+        #    discount - is tapped the moment it shows, and only rows priced like a wall get their name read
+        wl = (wiki_data().get("home:wall") or {}).get("levels") or []
+        near = lambda p, c: abs(p - c) <= max(c * 0.012, 600)
+        target, keep = [], None
+        if kind == "builder" and wl:
+            counts, mx, _, _ = walls_left(((self.cfg.get("scans") or {}).get(self._last_name) or {}).get("home") or {})
+            low = min((lv for lv in counts if mx and lv < mx), default=None)
+            target = [wl[low]["cost"] * f for f in DISCOUNTS] if low is not None and low < len(wl) else []
+            costs = [lv["cost"] * f for lv in wl for f in DISCOUNTS]
+            keep = lambda p: any(near(p, c) for c in costs)
+        budget = getattr(self, "_wall_budget", None)
         if panel_box(self.shot()):
             self.tap(icon, 1.0)  # close + reopen: from the top
         self.tap(icon, 1.3)
-        prices, prev, opened = set(), None, False
+        prices, prev, opened, hit = set(), None, False, None
         for _ in range(16):
             f = self.list_settled()
-            if not panel_box(f):
+            box = panel_box(f)
+            if not box:
                 if self.v.find(f, "all_upgrades_complete", 0.75):  # a fully maxed village: no list at all
                     opened = True
                     break
                 self.sleep(0.6)
                 continue
             opened = True
-            prices |= {r[1] for r in list_rows(f) if is_wall(r[0])}
-            sig = [r[:2] for r in list_rows(f)]
+            rows = list_rows(f, keep)
+            walls = [r for r in rows if is_wall(r[0])]
+            prices |= {r[1] for r in walls}
+            hit = next((r for r in walls if any(near(r[1], t) for t in target) and box[2] + 40 < r[3][1] < box[3] - 40),
+                       None)
+            if hit:
+                break
+            sig = [r[:2] for r in rows]
             if sig == prev:
                 break  # didn't move: the bottom
             prev = sig
-            self.scroll_panel(panel_box(f))
+            self.scroll_panel(box)
+        if hit and (budget is None or hit[1] <= budget):  # the lowest level, on screen now: tap it right away
+            prices = {hit[1]}
         self._no_wall_rows = opened and not prices  # the list opened, read to the end: no 'Wall' row = all max
         if not prices:
             if panel_box(self.shot()):
@@ -2420,16 +2445,19 @@ class Bot:
             self.tap(icon, 1.0)
             return None
         want = min(fits)  # the cheapest level we can pay
-        # 2) back to the top, then down until that level's row is on screen - tapped where it is NOW
-        self.tap(icon, 1.0)
-        self.tap(icon, 1.3)
-        rows = []
-        for _ in range(16):
+        rows = [hit[3]] if hit and hit[1] == want else []
+        # 2) (not known which level is the lowest) back to the top, then down until that level's row is on screen -
+        #    tapped where it is NOW
+        if not rows:
+            self.tap(icon, 1.0)
+            self.tap(icon, 1.3)
+        for _ in range(0 if rows else 16):
             f = self.list_settled()
             box = panel_box(f)
             if not box:
                 break
-            rows = [r[3] for r in list_rows(f) if is_wall(r[0]) and r[1] == want and box[2] + 40 < r[3][1] < box[3] - 40]
+            rows = [r[3] for r in list_rows(f, keep) if is_wall(r[0]) and r[1] == want
+                    and box[2] + 40 < r[3][1] < box[3] - 40]
             if rows:
                 break
             self.scroll_panel(box)
@@ -3081,7 +3109,7 @@ class Bot:
     def scroll_panel(self, box):
         x0, x1, y0, y1 = box
         cx = (x0 + x1) // 2
-        self.adb.swipe(cx, y1 - 90, cx, max(y0 + 90, y1 - 90 - 380), self.cfg["bank_scroll_duration_ms"])
+        self.adb.swipe(cx, y1 - 90, cx, max(y0 + 90, y1 - 90 - 540), max(900, self.cfg["bank_scroll_duration_ms"]))
         self.sleep(self.cfg["bank_scroll_delay"])
 
     def upgrade_from_list(self, kind):
