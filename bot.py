@@ -75,7 +75,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths, constants, config
 # ---------------------------------------------------------------------------
-APP_VERSION = 84  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
+APP_VERSION = 85  # bumped by `python bot.py --publish`; friends get an Update button when GitHub has a higher one
 APP_ID = "GeoCol.LootFarmer"  # Windows taskbar identity (window + Start menu / desktop shortcuts)
 UPDATE_REPO = "Geo-Col/lf-app"  # was Geo-Col/LootFarmer (GitHub redirects the old name)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2081,14 +2081,38 @@ class Bot:
         self.log("Found a battle in progress - watching damage.")
         self.finish_battle()
 
+    def prep_view(self):
+        """Zoom fully out (two pinches reach the limit from any zoom), lift every finger, drag the camera into the
+        deploy corner."""
+        zoom_out(self.adb, times=2)
+        touch_release(self.adb)
+        pan_view(self.adb, self.cfg["deploy_pan"])
+
+    def check_view(self):
+        """Right before deploying: is the camera really in the corner? One more pan tells - in the corner nothing
+        moves. If the view moved, the game had reset the camera after the background zoom + pan (a base still
+        loading): zoom + pan again until a pan no longer moves it. Saved drop lines only fit that exact view."""
+        part = lambda f: cv2.cvtColor(f[150:800:4, 300:1600:4], cv2.COLOR_BGR2GRAY).astype(np.int16)
+        for i in range(3):
+            touch_release(self.adb)
+            before = self.adb.screenshot()
+            pan_view(self.adb, self.cfg["deploy_pan"])
+            time.sleep(0.5)
+            after = self.adb.screenshot()
+            if before.shape != after.shape or float(np.abs(part(before) - part(after)).mean()) <= 6:
+                return  # nothing moved: in the corner
+            log_file.info("view check: the camera wasn't in the deploy corner - zooming out + panning again")
+            if i == 0:
+                self.log("The camera had moved off the drop corner - setting it again before deploying.", "warn")
+            zoom_out(self.adb, times=2)
+
     def start_view(self):
         """Zoom fully out + pan to the drop corner in the background while the loot is read, so the deploy can
         start straight away (it took ~6 s at deploy time). The adb shell is locked: a Next tap simply waits."""
         if self._view is None and self.cfg.get("deploy_pan", "off") in PAN_DIRS:
             def work():
                 try:
-                    zoom_out(self.adb, times=2)  # two pinches reach the limit from any zoom (measured)
-                    pan_view(self.adb, self.cfg["deploy_pan"])
+                    self.prep_view()
                 except Exception as e:
                     log_file.info(f"view prep: {e}")
             self._view = threading.Thread(target=work, daemon=True)
@@ -2266,9 +2290,10 @@ class Bot:
         if self._view:  # zoomed out + panned while scouting (normally done by now)
             self._view.join(15)
         elif c.get("deploy_pan", "off") in PAN_DIRS:  # each account/village keeps its own zoom: zoom fully out
-            zoom_out(self.adb, times=2)             # first, so the pan lands on the same view every time
-            pan_view(self.adb, c["deploy_pan"])
+            self.prep_view()                        # first, so the pan lands on the same view every time
         self._view = None
+        if c.get("deploy_pan", "off") in PAN_DIRS:
+            self.check_view()
         self.sleep(0.3)
         path = self.line()
         bar = None
@@ -5235,6 +5260,17 @@ def touch_ev(adb):
     return _TOUCH["ev"]
 
 
+def touch_release(adb):
+    """Lift every finger on the touch device - a pinch cut short can leave one 'down', and the game then ignores
+    the next drag."""
+    d = touch_device(adb)
+    if not d:
+        return
+    ev = touch_ev(adb)
+    b = b"".join(ev(3, 47, s) + ev(3, 57, -1) for s in range(2)) + ev(1, 330, 0) + ev(0, 0, 0)
+    adb.shell(f"echo {base64.b64encode(b).decode()} | base64 -d > {d[0]}", timeout=10)
+
+
 def zoom_out(adb, times=3, W=1920, H=1080, spread=((460, 900), (1460, 1020))):
     """Two-finger pinch (fingers moving together) = the game's zoom-out, sent straight to the touch device.
     Stops at the game's limit, so extra pinches are harmless. Raw input_event structs are written in one shell
@@ -5577,7 +5613,7 @@ class DropLinePicker(tk.Toplevel):
         where = self.app.cfg.get("deploy_pan", "off")
         if where not in PAN_DIRS:
             return messagebox.showinfo("Pan", "Set 'Pan view before deploying' in Settings > Battle first.", parent=self)
-        self.app.bg(lambda: (zoom_out(self.app.adb), pan_view(self.app.adb, where), time.sleep(0.6),
+        self.app.bg(lambda: (zoom_out(self.app.adb), touch_release(self.app.adb), pan_view(self.app.adb, where), time.sleep(0.6),
                              self.app.ui(self.refresh)))
 
     def save(self):
